@@ -1,0 +1,44 @@
+app:
+  timezone: "Asia/Tokyo"
+  history_days: 120
+  llm_input_lookback_days: 60
+  allow_morning_on_holiday: true
+  send_holiday_notice: true
+  log_level: "INFO"
+  disclaimer: "※本通知は情報提供のみを目的としており、投資助言ではありません。最終的な投資判断はご自身の責任でお願いします。"
+
+database:
+  echo: false
+
+jquants:
+  base_url: "https://api.jquants.com"
+  timeout_sec: 20
+  polling:
+    enabled: true
+    interval_sec: 300
+    max_wait_minutes: 180
+
+discord:
+  max_message_chars: 1900
+  split_max_parts: 2
+
+llm:
+  base_url: "http://host.docker.internal:1234/v1"
+  model_name: "gpt-oss-20b"
+  temperature: 0.1
+  timeout_sec: 120
+
+external_fx:
+  use_fallback: true
+  alpha_vantage_base_url: "https://www.alphavantage.co/query"
+
+scheduler:
+  morning_cron: "0 8 * * 1-5"
+  close_cron: "30 15 * * 1-5"
+  timezone: "Asia/Tokyo"
+
+market:
+  index_codes:
+    - "NIKKEI225"
+  usd_jpy_symbol: "USDJPY"
+

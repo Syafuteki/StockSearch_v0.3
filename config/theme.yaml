@@ -1,0 +1,22 @@
+schedule:
+  weekly_discovery_cron: "20 7 * * 1"
+  daily_strength_cron: "40 7 * * 1-5"
+
+seed_themes:
+  - name: "半導体"
+    keywords: ["半導体", "fab", "wafer", "chip", "EUV"]
+    allowed_sources: ["company_ir", "edinet"]
+  - name: "防衛"
+    keywords: ["防衛", "security", "military", "aerospace"]
+    allowed_sources: ["company_ir", "edinet"]
+  - name: "AIインフラ"
+    keywords: ["AI", "GPU", "datacenter", "inference", "LLM"]
+    allowed_sources: ["company_ir", "edinet"]
+
+mapping:
+  min_confidence: 0.50
+  boost_on_keyword_hits: 0.08
+  max_symbols_per_theme: 200
+
+daily_strength:
+  significant_delta: 0.15

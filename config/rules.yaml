@@ -1,0 +1,40 @@
+version: "2026.02.14.1"
+description: "MVP initial rules"
+
+step1:
+  require_common_stock: true
+  min_price: 300
+  min_volume: 200000
+  min_traded_value: 60000000
+  min_market_cap: 10000000000
+  market_cap_filter: true
+  allow_disable_market_cap_filter: true
+
+step2:
+  use_adj_close: true
+  top_n: 30
+  features:
+    ma: true
+    momentum: true
+    breakout: true
+    volume: true
+    atr: true
+  filters:
+    trend_required: true
+    breakout_min: -0.01
+    rsi_overheat: 80
+    rsi_penalty: 0.50
+  weights:
+    roc20: 1.20
+    roc60: 1.00
+    volume_ratio: 0.80
+    breakout_strength: 1.10
+    volatility_penalty: 0.90
+
+step3:
+  top_n: 10
+  sq_week_window_business_days: 2
+  fallback_to_step2_on_llm_error: true
+  prefer_llm_rank: true
+  event_weight: 1.0
+

@@ -1,0 +1,24 @@
+schedule:
+  weekly_cron: "0 7 * * 1"
+  daily_refresh_cron: "10 7 * * 1-5"
+
+states:
+  in_min: 0.65
+  watch_min: 0.45
+
+weights:
+  profitability: 0.30
+  growth: 0.25
+  efficiency: 0.20
+  stability: 0.15
+  valuation: 0.10
+
+thresholds:
+  roe_min: 0.08
+  operating_margin_min: 0.05
+  equity_ratio_min: 0.30
+  debt_ratio_max: 2.0
+
+expiry:
+  watch_days: 90
+  intel_impact_decay_days: 14

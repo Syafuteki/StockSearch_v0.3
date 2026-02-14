@@ -1,0 +1,22 @@
+tags:
+  earnings:
+    emoji: "🗓️"
+    severity: "high"
+    order: 10
+    label: "決算"
+  margin_alert:
+    emoji: "⚠️"
+    severity: "high"
+    order: 20
+    label: "信用規制"
+  short_sale:
+    emoji: "📉"
+    severity: "medium"
+    order: 30
+    label: "空売り"
+  sq_week:
+    emoji: "🧭"
+    severity: "medium"
+    order: 40
+    label: "SQ週"
+

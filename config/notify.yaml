@@ -1,0 +1,9 @@
+discord:
+  webhooks:
+    tech: ${DISCORD_WEBHOOK_TECH}
+    fund_intel: ${DISCORD_WEBHOOK_FUND_INTEL}
+    proposals: ${DISCORD_WEBHOOK_PROPOSALS}
+  threads:
+    tech: null
+    fund_intel: null
+    proposals: null

@@ -1,0 +1,34 @@
+budget:
+  daily_budget: 10
+  morning_cap: 4
+  close_cap: 6
+
+search:
+  use_mcp: false
+  mcp_server: ""
+  mcp_endpoint: ""
+  whitelist_domains:
+    - "disclosure2.edinet-fsa.go.jp"
+    - "jpx.co.jp"
+  company_ir_domains: {}
+  request_timeout_sec: 20
+  max_items_per_symbol: 5
+
+notify:
+  high_signal_tags:
+    - "theme_breakout"
+    - "upward_revision"
+    - "buyback"
+    - "strategic_partnership"
+    - "new_product"
+  risk_hard_keys:
+    - "fraud"
+    - "going_concern"
+    - "material_litigation"
+    - "regulatory_action"
+    - "delisting_risk"
+  require_state_change_or_signal: true
+
+llm:
+  temperature: 0.0
+  retries: 2
