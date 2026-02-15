@@ -22,3 +22,11 @@ thresholds:
 expiry:
   watch_days: 90
   intel_impact_decay_days: 14
+
+carry_forward:
+  enabled: true
+  states: ["IN", "WATCH"]
+
+bootstrap:
+  lookback_business_days: 260
+  request_interval_sec: 0.0

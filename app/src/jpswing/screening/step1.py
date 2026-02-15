@@ -53,11 +53,13 @@ def build_universe(
     merged["price_for_filter"] = merged[price_col].fillna(merged["close"])
     merged["traded_value"] = merged["price_for_filter"] * merged["volume"].fillna(0)
 
-    raw_market_cap = merged["market_cap"].fillna(merged["market_cap_m"])
-    issued = merged["issued_shares"].fillna(0)
-    estimated_market_cap = merged["price_for_filter"] * issued
-    market_cap_estimated = raw_market_cap.isna() & estimated_market_cap.notna() & (issued > 0)
-    merged["market_cap_effective"] = raw_market_cap.fillna(estimated_market_cap)
+    raw_market_cap = pd.to_numeric(merged["market_cap"], errors="coerce").combine_first(
+        pd.to_numeric(merged["market_cap_m"], errors="coerce")
+    )
+    issued = pd.to_numeric(merged["issued_shares"], errors="coerce")
+    estimated_market_cap = (pd.to_numeric(merged["price_for_filter"], errors="coerce") * issued).where(issued > 0)
+    market_cap_estimated = raw_market_cap.isna() & estimated_market_cap.notna()
+    merged["market_cap_effective"] = raw_market_cap.combine_first(estimated_market_cap)
     merged["market_cap_estimated"] = market_cap_estimated
 
     has_market_cap_data = merged["market_cap_effective"].notna().any()
@@ -98,4 +100,3 @@ def build_universe(
         axis=1,
     )
     return passed
-

@@ -36,6 +36,20 @@ def is_business_day(target_date: date, rows: list[dict[str, Any]]) -> bool:
             if flag is not None:
                 return flag
 
+        # J-Quants calendar commonly uses HolDiv where "1" means business day.
+        for key in ("HolDiv", "hol_div", "holDiv", "HolidayDivision", "holiday_division"):
+            holdiv = row.get(key)
+            if holdiv is None:
+                continue
+            txt = str(holdiv).strip()
+            if txt == "1":
+                return True
+            if txt in {"0", "2", "3", "4", "5"}:
+                return False
+            flag = _to_bool(holdiv)
+            if flag is not None:
+                return flag
+
         holiday_div = row.get("HolidayDivision") or row.get("holiday_division")
         if holiday_div is not None:
             flag = _to_bool(holiday_div)
@@ -69,4 +83,3 @@ def previous_business_day(target_date: date, rows: list[dict[str, Any]]) -> date
     while not is_business_day(day, rows):
         day -= timedelta(days=1)
     return day
-

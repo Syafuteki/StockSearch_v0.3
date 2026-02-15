@@ -15,6 +15,32 @@ def _fmt_num(value: Any, digits: int = 2) -> str:
         return "N/A"
 
 
+def _display_code(raw_code: Any) -> str:
+    code = str(raw_code or "").strip()
+    # J-Quants local code (5 digits) is often displayed as 4 digits by dropping trailing "0".
+    if len(code) == 5 and code.isdigit() and code.endswith("0"):
+        return code[:-1]
+    return code
+
+
+def _safe_text_list(value: Any, *, fallback: str = "未取得", limit: int = 2) -> str:
+    if not isinstance(value, list):
+        return fallback
+    cleaned = [str(v).strip() for v in value if str(v).strip()]
+    if not cleaned:
+        return fallback
+    return " / ".join(cleaned[:limit])
+
+
+def _safe_level_text(value: Any, *, fallback: str = "未取得") -> str:
+    text = str(value or "").strip()
+    if not text:
+        return fallback
+    if text.lower() in {"n/a", "na", "none", "null", "unknown", "-", "not available"}:
+        return fallback
+    return text
+
+
 def split_messages(text: str, max_chars: int, max_parts: int) -> list[str]:
     if len(text) <= max_chars:
         return [text]
@@ -76,16 +102,17 @@ def format_report_message(
 
     for _, row in top10_df.iterrows():
         code = str(row.get("code"))
+        display_code = _display_code(code)
         name = str(row.get("name") or "")
         rank = int(row.get("rank"))
         llm = llm_map.get(code, {})
-        bull = " / ".join(llm.get("thesis_bull", [])[:2]) if llm else "未取得"
-        bear = " / ".join(llm.get("thesis_bear", [])[:2]) if llm else "未取得"
+        bull = _safe_text_list(llm.get("thesis_bull")) if llm else "未取得"
+        bear = _safe_text_list(llm.get("thesis_bear")) if llm else "未取得"
         key_levels = llm.get("key_levels", {})
         events = llm.get("event_risks", [])
         confidence = llm.get("confidence_0_100", "N/A")
 
-        lines.append(f"【{rank}】{code} {name}".strip())
+        lines.append(f"【{rank}】{display_code} {name}".strip())
         lines.append(
             "テクニカル: "
             f"MA25={_fmt_num(row.get('ma25'))} "
@@ -97,9 +124,9 @@ def format_report_message(
         lines.append(f"下落シナリオ: {bear}")
         lines.append(
             "目安: "
-            f"エントリー={key_levels.get('entry_idea', '未取得')} / "
-            f"利確={key_levels.get('takeprofit_idea', '未取得')} / "
-            f"損切り={key_levels.get('stop_idea', '未取得')}"
+            f"エントリー={_safe_level_text(key_levels.get('entry_idea'))} / "
+            f"利確={_safe_level_text(key_levels.get('takeprofit_idea'))} / "
+            f"損切り={_safe_level_text(key_levels.get('stop_idea'))}"
         )
         lines.append(f"注意イベント: {' / '.join(events) if events else '特記事項なし'}")
         lines.append(f"自信度: {confidence}")

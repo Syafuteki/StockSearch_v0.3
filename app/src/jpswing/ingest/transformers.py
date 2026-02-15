@@ -11,8 +11,8 @@ def normalize_instrument_row(row: dict[str, Any]) -> dict[str, Any] | None:
         return None
     return {
         "code": str(code).strip(),
-        "name": pick_first(row, ["CompanyName", "Name", "name", "IssueName"]),
-        "market": pick_first(row, ["MarketCodeName", "MarketName", "MarketCode", "market"]),
+        "name": pick_first(row, ["CompanyName", "CoName", "Name", "name", "IssueName", "CoNameEn"]),
+        "market": pick_first(row, ["MarketCodeName", "MarketName", "MktNm", "Mkt", "MarketCode", "market"]),
         "issued_shares": to_int(pick_first(row, ["IssuedShares", "issued_shares", "NumberOfIssuedAndOutstandingSharesAtTheEnd"])),
         "market_cap": to_float(pick_first(row, ["MarketCapitalization", "market_cap", "MarketCap"])),
         "raw_json": row,

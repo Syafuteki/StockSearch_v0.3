@@ -34,18 +34,34 @@ class LlmClient:
             "model": self.model_name,
             "temperature": self.temperature,
             "messages": messages,
-            "response_format": {"type": "json_object"},
         }
+
+        def _is_retriable(exc: Exception) -> bool:
+            if isinstance(exc, RuntimeError):
+                return True
+            return False
 
         def _run() -> dict[str, Any]:
             response = httpx.post(endpoint, headers=headers, json=payload, timeout=self.timeout_sec)
             if response.status_code in {429, 500, 502, 503, 504}:
                 raise RuntimeError(f"LLM temporary error: {response.status_code}")
+            if 400 <= response.status_code < 500:
+                self.logger.error(
+                    "LLM client error status=%s body=%s",
+                    response.status_code,
+                    response.text[:1000],
+                )
             response.raise_for_status()
             data = response.json()
             if not isinstance(data, dict):
                 raise RuntimeError("LLM response is not a JSON object")
             return data
 
-        return retry_with_backoff(_run, retries=3, base_delay_sec=1.5, backoff=2.0, logger=self.logger)
-
+        return retry_with_backoff(
+            _run,
+            retries=3,
+            base_delay_sec=1.5,
+            backoff=2.0,
+            retriable=_is_retriable,
+            logger=self.logger,
+        )

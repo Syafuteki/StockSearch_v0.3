@@ -33,12 +33,16 @@ class JQuantsConfig(BaseModel):
 class DiscordWebhooksConfig(BaseModel):
     tech: str = ""
     fund_intel: str = ""
+    fund_intel_flash: str = ""
+    fund_intel_detail: str = ""
     proposals: str = ""
 
 
 class DiscordThreadsConfig(BaseModel):
     tech: str | None = None
     fund_intel: str | None = None
+    fund_intel_flash: str | None = None
+    fund_intel_detail: str | None = None
     proposals: str | None = None
 
 
@@ -65,7 +69,7 @@ class ExternalFxConfig(BaseModel):
 
 
 class EdinetConfig(BaseModel):
-    base_url: str = "https://disclosure2.edinet-fsa.go.jp"
+    base_url: str = "https://api.edinet-fsa.go.jp"
     api_key: str = ""
     timeout_sec: int = 30
 
@@ -164,6 +168,17 @@ def _expand_env_placeholders(value: Any) -> Any:
     return value
 
 
+def _env_to_bool(raw: str | None) -> bool | None:
+    if raw is None:
+        return None
+    value = raw.strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+    return None
+
+
 def _apply_env_overrides(app_cfg: dict[str, Any]) -> dict[str, Any]:
     out = copy.deepcopy(app_cfg)
     env_map = {
@@ -172,11 +187,14 @@ def _apply_env_overrides(app_cfg: dict[str, Any]) -> dict[str, Any]:
         ("discord", "webhook_url"): "DISCORD_WEBHOOK_URL",
         ("discord", "webhooks", "tech"): "DISCORD_WEBHOOK_TECH",
         ("discord", "webhooks", "fund_intel"): "DISCORD_WEBHOOK_FUND_INTEL",
+        ("discord", "webhooks", "fund_intel_flash"): "DISCORD_WEBHOOK_FUND_INTEL_FLASH",
+        ("discord", "webhooks", "fund_intel_detail"): "DISCORD_WEBHOOK_FUND_INTEL_DETAIL",
         ("discord", "webhooks", "proposals"): "DISCORD_WEBHOOK_PROPOSALS",
         ("llm", "base_url"): "LMSTUDIO_BASE_URL",
         ("llm", "api_key"): "LMSTUDIO_API_KEY",
         ("llm", "model_name"): "LLM_MODEL_NAME",
         ("external_fx", "alpha_vantage_api_key"): "ALPHAVANTAGE_API_KEY",
+        ("edinet", "base_url"): "EDINET_BASE_URL",
         ("edinet", "api_key"): "EDINET_API_KEY",
         ("rag", "embedding_base_url"): "EMBEDDING_BASE_URL",
         ("rag", "embedding_api_key"): "EMBEDDING_API_KEY",
@@ -214,6 +232,22 @@ def load_settings(config_dir: str | Path = "config") -> Settings:
         intel.setdefault("search", {})
         if isinstance(intel["search"], dict):
             intel["search"]["mcp_endpoint"] = mcp_endpoint
+    mcp_server = os.getenv("INTEL_MCP_SERVER")
+    if mcp_server:
+        intel.setdefault("search", {})
+        if isinstance(intel["search"], dict):
+            intel["search"]["mcp_server"] = mcp_server
+    mcp_plugin_ids = os.getenv("INTEL_MCP_PLUGIN_IDS")
+    if mcp_plugin_ids:
+        intel.setdefault("search", {})
+        if isinstance(intel["search"], dict):
+            parsed = [x.strip() for x in mcp_plugin_ids.split(",") if x.strip()]
+            intel["search"]["mcp_plugin_ids"] = parsed
+    mcp_bool = _env_to_bool(os.getenv("INTEL_USE_MCP"))
+    if mcp_bool is not None:
+        intel.setdefault("search", {})
+        if isinstance(intel["search"], dict):
+            intel["search"]["use_mcp"] = mcp_bool
 
     merged_app = _deep_merge(AppConfig().model_dump(), app_yaml)
     if isinstance(notify, dict) and isinstance(notify.get("discord"), dict):

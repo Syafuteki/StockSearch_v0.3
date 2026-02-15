@@ -8,12 +8,30 @@ from pydantic import ValidationError
 from jpswing.llm.schema import LlmTop10Response
 
 
+def _extract_first_json_block(text: str) -> str:
+    decoder = json.JSONDecoder()
+    for idx, ch in enumerate(text):
+        if ch not in "{[":
+            continue
+        try:
+            _, end = decoder.raw_decode(text[idx:])
+        except json.JSONDecodeError:
+            continue
+        return text[idx : idx + end]
+    return text
+
+
 def extract_json_text(content: str) -> str:
     text = content.strip()
     if text.startswith("```"):
         lines = text.splitlines()
         if len(lines) >= 3 and lines[0].startswith("```") and lines[-1].startswith("```"):
             text = "\n".join(lines[1:-1]).strip()
+    marker = "<|message|>"
+    marker_pos = text.find(marker)
+    if marker_pos >= 0:
+        text = text[marker_pos + len(marker) :].strip()
+    text = _extract_first_json_block(text)
     return text
 
 
@@ -30,4 +48,3 @@ def validate_llm_output(content: str) -> tuple[LlmTop10Response | None, str | No
     except ValidationError as exc:
         return None, f"schema_error:{exc}", payload if isinstance(payload, dict) else None
     return model, None, payload
-

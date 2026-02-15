@@ -237,6 +237,197 @@ class SwingPipeline:
         self.logger.info("Pipeline end run_type=%s report_date=%s status=%s", run_type, report_date, result.get("status"))
         return result
 
+    def run_intel_background(self, report_date: date) -> dict[str, Any]:
+        intel_schedule = self.settings.intel_config.get("schedule", {})
+        session_name = str(intel_schedule.get("session", "close")).strip() or "close"
+        run_on_holiday = bool(intel_schedule.get("run_on_holiday", False))
+        use_prev_on_holiday = bool(intel_schedule.get("use_previous_business_day_on_holiday", False))
+
+        calendar_rows = self._fetch_calendar(report_date - timedelta(days=240), report_date + timedelta(days=14))
+        business_today = is_business_day(report_date, calendar_rows)
+        if business_today:
+            business_date = report_date
+        else:
+            if not run_on_holiday:
+                self.logger.info("Intel background skipped on holiday: %s", report_date)
+                return {"status": "holiday_skip", "report_date": report_date.isoformat(), "reason": "run_on_holiday=false"}
+            if use_prev_on_holiday:
+                business_date = previous_business_day(report_date, calendar_rows)
+            else:
+                business_date = report_date
+
+        self.logger.info(
+            "Intel background run start report_date=%s business_date=%s session=%s",
+            report_date,
+            business_date,
+            session_name,
+        )
+        try:
+            result = self.fund_intel_orchestrator.run_intel_only(
+                session_name=session_name,
+                business_date=business_date,
+            )
+            self.logger.info("Intel background run end result=%s", result)
+            return result
+        except Exception as exc:  # noqa: BLE001
+            self.logger.error("Intel background run failed: %s", exc)
+            return {"status": "error", "error": str(exc), "report_date": report_date.isoformat()}
+
+    def run_backfill_range(
+        self,
+        *,
+        start_date: date,
+        end_date: date,
+        mode: str = "close_only",
+    ) -> dict[str, Any]:
+        if end_date < start_date:
+            return {
+                "status": "invalid_range",
+                "start_date": start_date.isoformat(),
+                "end_date": end_date.isoformat(),
+            }
+        mode_map = {
+            "close_only": ["close"],
+            "morning_close": ["morning", "close"],
+        }
+        run_types = mode_map.get(mode)
+        if not run_types:
+            return {"status": "invalid_mode", "mode": mode}
+
+        calendar_rows = self._fetch_calendar(start_date - timedelta(days=30), end_date + timedelta(days=14))
+        target_days = business_days_in_range(calendar_rows, start_date, end_date)
+        if not target_days:
+            return {
+                "status": "no_business_days",
+                "start_date": start_date.isoformat(),
+                "end_date": end_date.isoformat(),
+            }
+
+        self.logger.info(
+            "Backfill range start from=%s to=%s mode=%s business_days=%s",
+            start_date,
+            end_date,
+            mode,
+            len(target_days),
+        )
+        summary_rows: list[dict[str, Any]] = []
+        ok_days = 0
+        failed_days = 0
+        for i, d in enumerate(target_days, start=1):
+            row: dict[str, Any] = {"date": d.isoformat(), "runs": {}}
+            day_ok = True
+            self.logger.info("Backfill day %s/%s date=%s mode=%s", i, len(target_days), d, mode)
+            for rt in run_types:
+                result = self.run(rt, d)
+                status = str(result.get("status"))
+                row["runs"][rt] = status
+                if status != "ok":
+                    day_ok = False
+            if day_ok:
+                ok_days += 1
+            else:
+                failed_days += 1
+                summary_rows.append(row)
+
+        self.logger.info(
+            "Backfill range end from=%s to=%s mode=%s ok_days=%s failed_days=%s",
+            start_date,
+            end_date,
+            mode,
+            ok_days,
+            failed_days,
+        )
+        return {
+            "status": "ok",
+            "start_date": start_date.isoformat(),
+            "end_date": end_date.isoformat(),
+            "mode": mode,
+            "business_days": len(target_days),
+            "ok_days": ok_days,
+            "failed_days": failed_days,
+            "failed_details": summary_rows[:20],
+        }
+
+    def run_auto_recover(self, report_date: date) -> dict[str, Any]:
+        cfg = self.settings.intel_config.get("recovery", {})
+        if not bool(cfg.get("enabled", False)):
+            return {"status": "disabled"}
+
+        lookback_business_days = max(1, int(cfg.get("lookback_business_days", 40)))
+        max_days_per_run = max(1, int(cfg.get("max_days_per_run", 3)))
+        mode = str(cfg.get("mode", "close_only")).strip() or "close_only"
+        run_on_holiday = bool(cfg.get("run_on_holiday", True))
+
+        calendar_rows = self._fetch_calendar(report_date - timedelta(days=lookback_business_days * 4), report_date + timedelta(days=14))
+        business_today = is_business_day(report_date, calendar_rows)
+        if not business_today and not run_on_holiday:
+            return {"status": "holiday_skip", "report_date": report_date.isoformat(), "reason": "run_on_holiday=false"}
+
+        # Avoid colliding with intraday close data update timing by recovering up to previous business day.
+        end_date = previous_business_day(report_date, calendar_rows)
+        if end_date >= report_date and business_today:
+            end_date = previous_business_day(end_date, calendar_rows)
+        if end_date is None:
+            return {"status": "no_target"}
+
+        biz_days = business_days_in_range(
+            calendar_rows,
+            end_date - timedelta(days=lookback_business_days * 4),
+            end_date,
+        )
+        if len(biz_days) > lookback_business_days:
+            biz_days = biz_days[-lookback_business_days:]
+        if not biz_days:
+            return {"status": "no_business_days"}
+
+        with self.db.session_scope() as session:
+            done_rows = session.execute(
+                select(ScreenTop30Daily.trade_date)
+                .where(
+                    ScreenTop30Daily.trade_date >= biz_days[0],
+                    ScreenTop30Daily.trade_date <= biz_days[-1],
+                )
+                .distinct()
+            ).all()
+        done_dates = {r[0] for r in done_rows if r and r[0] is not None}
+        missing_dates = [d for d in biz_days if d not in done_dates]
+        if not missing_dates:
+            return {
+                "status": "no_gap",
+                "from": biz_days[0].isoformat(),
+                "to": biz_days[-1].isoformat(),
+                "checked_days": len(biz_days),
+            }
+
+        targets = missing_dates[:max_days_per_run]
+        self.logger.info(
+            "Auto recover start report_date=%s mode=%s targets=%s",
+            report_date,
+            mode,
+            [d.isoformat() for d in targets],
+        )
+        mode_map = {
+            "close_only": ["close"],
+            "morning_close": ["morning", "close"],
+        }
+        run_types = mode_map.get(mode, ["close"])
+        repaired: list[dict[str, Any]] = []
+        for d in targets:
+            row: dict[str, Any] = {"date": d.isoformat(), "runs": {}}
+            for rt in run_types:
+                result = self.run(rt, d)
+                row["runs"][rt] = str(result.get("status"))
+            repaired.append(row)
+        return {
+            "status": "ok",
+            "report_date": report_date.isoformat(),
+            "mode": mode,
+            "checked_days": len(biz_days),
+            "missing_days": len(missing_dates),
+            "repaired_days": len(targets),
+            "details": repaired,
+        }
+
     def _execute(
         self,
         *,

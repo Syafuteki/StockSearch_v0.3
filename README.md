@@ -174,20 +174,27 @@ docker compose run --rm app alembic -c app/alembic.ini upgrade head
 - 休場: スキップまたは休場通知
 - LLM不正JSON: フォールバックでTop10確定
 
-## Discord Notification Router (3 Webhooks)
+## Discord Notification Router (5 Webhooks)
 
 Required env vars (`.env`):
 - `DISCORD_WEBHOOK_TECH` : TECH report channel webhook
-- `DISCORD_WEBHOOK_FUND_INTEL` : FUND Intel important change channel webhook
+- `DISCORD_WEBHOOK_FUND_INTEL` : FUND Intel legacy/common webhook (fallback)
+- `DISCORD_WEBHOOK_FUND_INTEL_FLASH` : FUND Intel速報 channel webhook
+- `DISCORD_WEBHOOK_FUND_INTEL_DETAIL` : FUND Intel深掘り channel webhook
 - `DISCORD_WEBHOOK_PROPOSALS` : proposals-only channel webhook
 
 Routing:
 - TECH (`Topic.TECH`) -> `DISCORD_WEBHOOK_TECH`
-- FUND Intel (`Topic.FUND_INTEL`) -> `DISCORD_WEBHOOK_FUND_INTEL`
+- FUND Intel速報 (`Topic.FUND_INTEL_FLASH`) -> `DISCORD_WEBHOOK_FUND_INTEL_FLASH`
+- FUND Intel深掘り (`Topic.FUND_INTEL_DETAIL`) -> `DISCORD_WEBHOOK_FUND_INTEL_DETAIL`
 - Proposals (`Topic.PROPOSALS`) -> `DISCORD_WEBHOOK_PROPOSALS`
 
+Fallback behavior:
+- If `DISCORD_WEBHOOK_FUND_INTEL_FLASH` is empty, router falls back to `DISCORD_WEBHOOK_FUND_INTEL`.
+- If `DISCORD_WEBHOOK_FUND_INTEL_DETAIL` is empty, router falls back to `DISCORD_WEBHOOK_FUND_INTEL`.
+
 Optional thread routing:
-- Set `config/notify.yaml` `discord.threads.tech|fund_intel|proposals`
+- Set `config/notify.yaml` `discord.threads.tech|fund_intel_flash|fund_intel_detail|proposals`
 - Router sends webhook execute URL with `?thread_id=<id>&wait=true`
 
 Behavior:
@@ -211,4 +218,82 @@ docker compose up --build
 2. If you must keep volume data, run extension creation manually once:
 ```powershell
 docker compose exec postgres psql -U $env:POSTGRES_USER -d $env:POSTGRES_DB -c "CREATE EXTENSION IF NOT EXISTS vector;"
+```
+
+## FUND Bootstrap and Carry-Forward
+
+To initialize FUND for newly built environments, run historical backfill once:
+
+```powershell
+docker compose run --rm app python -m jpswing.main --once --run-type fund_backfill --date 2026-02-13
+```
+
+Behavior:
+- `fund_backfill` scans past business days (`config/fund.yaml` -> `bootstrap.lookback_business_days`) and updates FUND states from `fins/summary`.
+- After backfill, daily refresh carries previous FUND snapshots forward for missing disclosures (`carry_forward.enabled=true`).
+- Carry-forward target states are configurable (`carry_forward.states`, default `IN/WATCH`).
+
+## Intel LM Studio MCP mode
+
+Intel LLM can use LM Studio MCP tools directly (without `INTEL_MCP_ENDPOINT`) when these are set:
+
+- `INTEL_USE_MCP=true`
+- `INTEL_MCP_PLUGIN_IDS=mcp/<plugin_id_1>,mcp/<plugin_id_2>`
+  - Example: `INTEL_MCP_PLUGIN_IDS=mcp/playwright`
+
+Notes:
+
+- This path uses LM Studio `/api/v1/chat` with `integrations`.
+- If MCP call fails, app falls back to OpenAI-compatible `/v1/chat/completions`.
+- If `INTEL_USE_MCP=true` but no plugin IDs are configured, app logs a warning and runs without MCP tool calls.
+
+## Intel Background Scheduler
+
+Intel can run independently from TECH hooks via scheduler.
+
+- Config: `config/intel.yaml` -> `schedule`
+  - `enabled`: enable/disable background Intel job
+  - `cron`: cron expression for periodic Intel runs
+  - `session`: `morning` or `close` (used for Intel queue idempotency key)
+  - `run_on_holiday`: run on non-business day or skip
+  - `use_previous_business_day_on_holiday`: if holiday and enabled, run with previous business date
+
+Manual one-shot command:
+
+```powershell
+docker compose run --rm app python -m jpswing.main --once --run-type intel_background --date 2026-02-16
+```
+
+## Outage Recovery (Date Range Backfill)
+
+When the app was down for multiple days (PC crash, power outage), replay missed business days:
+
+```powershell
+# close report only (recommended for catch-up speed)
+docker compose run --rm app python -m jpswing.main --once --run-type recover_range --from-date 2026-02-10 --to-date 2026-02-14 --recover-mode close_only
+
+# replay both morning and close
+docker compose run --rm app python -m jpswing.main --once --run-type recover_range --from-date 2026-02-10 --to-date 2026-02-14 --recover-mode morning_close
+```
+
+Notes:
+- `recover_range` runs only for business days in the range.
+- `close_only` is faster and usually sufficient for operational catch-up.
+- Results summary includes `ok_days`, `failed_days`, and `failed_details` (up to 20 rows).
+
+### Auto Recover Scheduler
+
+Automatic missed-day recovery is available via `config/intel.yaml` -> `recovery`:
+
+- `enabled`: enable/disable auto recovery job
+- `cron`: when to check for missed business days
+- `lookback_business_days`: window to inspect for gaps
+- `max_days_per_run`: cap replay volume per run
+- `mode`: `close_only` or `morning_close`
+- `run_on_holiday`: allow recovery checks on holidays/weekends
+
+Manual one-shot for the same logic:
+
+```powershell
+docker compose run --rm app python -m jpswing.main --once --run-type auto_recover --date 2026-02-16
 ```

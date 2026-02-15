@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from datetime import date
 from typing import Any
 
+from sqlalchemy import and_
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -26,12 +27,41 @@ def _metric(row: dict[str, Any], keys: list[str]) -> float | None:
     return to_float(pick_first(row, keys))
 
 
+def _safe_ratio(numerator: float | None, denominator: float | None) -> float | None:
+    if numerator is None or denominator is None:
+        return None
+    if denominator == 0:
+        return None
+    return numerator / denominator
+
+
+def _normalize_ratio_value(value: float | None) -> float | None:
+    if value is None:
+        return None
+    # Some feeds use percentage notation (e.g., 62.8) while others use ratio (0.628).
+    if value > 1.0 and value <= 100.0:
+        return value / 100.0
+    return value
+
+
 def _infer_state(score: float, in_min: float, watch_min: float) -> str:
     if score >= in_min:
         return "IN"
     if score >= watch_min:
         return "WATCH"
     return "OUT"
+
+
+def _dedupe_financial_rows(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    # J-Quants financial summary can include multiple rows for the same code on one date.
+    # Keep the last seen row per code to avoid duplicate snapshot inserts.
+    out: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        code = pick_first(row, ["Code", "code", "LocalCode", "IssueCode"])
+        if not code:
+            continue
+        out[str(code).strip()] = row
+    return out
 
 
 class FundService:
@@ -46,15 +76,21 @@ class FundService:
         business_date: date,
         jquants: JQuantsClient,
         force: bool = False,
+        master_rows: list[dict[str, Any]] | None = None,
+        carry_forward: bool | None = None,
     ) -> list[FundChange]:
         fin_rows = jquants.fetch_financial_summary(business_date)
         if not fin_rows and not force:
             self.logger.info("No financial summary update at %s", business_date)
+            if self._carry_forward_enabled(carry_forward):
+                carried = self._carry_forward_snapshots(session, business_date, updated_codes=set())
+                if carried:
+                    self.logger.info("Carried forward fund snapshots at %s: rows=%s", business_date, carried)
             return []
 
-        master_rows = jquants.fetch_equities_master(business_date)
+        effective_master_rows = master_rows if master_rows is not None else jquants.fetch_equities_master(business_date)
         issued_shares_map: dict[str, int] = {}
-        for row in master_rows:
+        for row in effective_master_rows:
             code = pick_first(row, ["Code", "code", "LocalCode", "IssueCode"])
             shares = to_int(pick_first(row, ["IssuedShares", "issued_shares", "NumberOfIssuedAndOutstandingSharesAtTheEnd"]))
             if code and shares:
@@ -71,12 +107,19 @@ class FundService:
             "valuation": float(w.get("valuation", 0.10)),
         }
 
+        fin_rows_by_code = _dedupe_financial_rows(fin_rows)
+        if len(fin_rows_by_code) < len(fin_rows):
+            self.logger.info(
+                "Financial summary rows deduped for %s: raw=%s unique_codes=%s",
+                business_date,
+                len(fin_rows),
+                len(fin_rows_by_code),
+            )
+
         changes: list[FundChange] = []
-        for row in fin_rows:
-            code = pick_first(row, ["Code", "code", "LocalCode", "IssueCode"])
-            if not code:
-                continue
-            code_s = str(code)
+        updated_codes: set[str] = set()
+        for code_s in sorted(fin_rows_by_code.keys()):
+            row = fin_rows_by_code[code_s]
             features, score, state, tags, gaps = self._score_row(
                 session=session,
                 code=code_s,
@@ -113,7 +156,12 @@ class FundService:
                 existing.tags = {"items": tags}
                 existing.data_gaps = {"items": gaps}
             self._upsert_snapshot(session, code_s, business_date, features)
+            updated_codes.add(code_s)
             changes.append(FundChange(code=code_s, before_state=before_state, after_state=state, changed=changed, reason=reason))
+        if self._carry_forward_enabled(carry_forward):
+            carried = self._carry_forward_snapshots(session, business_date, updated_codes=updated_codes)
+            if carried:
+                self.logger.info("Carried forward fund snapshots at %s: rows=%s", business_date, carried)
         return changes
 
     def apply_intel_aggregate(
@@ -169,14 +217,58 @@ class FundService:
         watch_min: float,
         weights: dict[str, float],
     ) -> tuple[dict[str, Any], float, str, list[str], list[str]]:
+        sales = _metric(row, ["Sales", "NCSales"])
+        op = _metric(row, ["OP", "NCOP"])
+        np = _metric(row, ["NP", "NCNP"])
+        f_sales = _metric(row, ["FSales", "FNCSales"])
+        eps = _metric(row, ["EPS", "NCEPS"])
+        f_eps = _metric(row, ["FEPS", "FNCEPS"])
+        bps = _metric(row, ["BPS", "NCBPS"])
+        eq = _metric(row, ["Eq", "NCEq"])
+        ta = _metric(row, ["TA", "NCTA"])
+
+        latest_bar = session.scalar(
+            select(DailyBar)
+            .where(DailyBar.code == code, DailyBar.trade_date <= business_date)
+            .order_by(DailyBar.trade_date.desc())
+            .limit(1)
+        )
+        latest_price = None
+        if latest_bar is not None:
+            latest_price = to_float((latest_bar.adj_close or latest_bar.close))
+
         roe = _metric(row, ["ROE", "roe", "ResultROE", "ForecastROE"])
+        if roe is None:
+            roe = _safe_ratio(np, eq)
+
         op_margin = _metric(row, ["OperatingMargin", "operating_margin", "ResultOperatingMargin"])
+        if op_margin is None:
+            op_margin = _safe_ratio(op, sales)
+
         rev_growth = _metric(row, ["RevenueGrowthRate", "revenue_growth_rate", "ResultRevenueGrowthRate"])
+        if rev_growth is None:
+            if f_sales is not None and sales not in (None, 0):
+                rev_growth = (f_sales - sales) / abs(sales)
+
         eps_growth = _metric(row, ["EPSGrowthRate", "eps_growth_rate", "ResultEPSGrowthRate"])
-        equity_ratio = _metric(row, ["EquityRatio", "equity_ratio", "ResultEquityRatio"])
+        if eps_growth is None:
+            if f_eps is not None and eps not in (None, 0):
+                eps_growth = (f_eps - eps) / abs(eps)
+
+        equity_ratio = _metric(row, ["EquityRatio", "equity_ratio", "ResultEquityRatio", "EqAR", "NCEqAR"])
+        equity_ratio = _normalize_ratio_value(equity_ratio)
+
         debt_ratio = _metric(row, ["DebtRatio", "debt_ratio", "ResultDebtRatio"])
+        if debt_ratio is None:
+            debt_ratio = _safe_ratio((ta - eq) if ta is not None and eq is not None else None, eq)
+
         pbr = _metric(row, ["PBR", "pbr"])
+        if pbr is None and latest_price is not None and bps is not None and bps > 0:
+            pbr = latest_price / bps
+
         per = _metric(row, ["PER", "per"])
+        if per is None and latest_price is not None and eps is not None and eps > 0:
+            per = latest_price / eps
 
         gaps: list[str] = []
         def norm(value: float | None, lo: float, hi: float, name: str) -> float:
@@ -199,14 +291,10 @@ class FundService:
             valuation = max(0.0, 1.0 - norm(per, 5.0, 40.0, "per"))
         else:
             # Derive rough valuation using market cap if possible.
-            latest_bar = session.scalar(
-                select(DailyBar)
-                .where(DailyBar.code == code, DailyBar.trade_date <= business_date)
-                .order_by(DailyBar.trade_date.desc())
-                .limit(1)
-            )
-            if latest_bar and issued_shares:
-                market_cap = float((latest_bar.adj_close or latest_bar.close or 0) or 0) * issued_shares
+            if issued_shares is None:
+                issued_shares = to_int(pick_first(row, ["ShOutFY", "IssuedShares", "NumberOfIssuedAndOutstandingSharesAtTheEnd"]))
+            if latest_price is not None and issued_shares:
+                market_cap = latest_price * issued_shares
                 valuation = max(0.0, 1.0 - min(1.0, market_cap / 1_000_000_000_000))
                 gaps.append("valuation_derived_from_market_cap")
             else:
@@ -266,3 +354,49 @@ class FundService:
         else:
             snap.features = features
 
+    def _carry_forward_enabled(self, override: bool | None) -> bool:
+        if override is not None:
+            return bool(override)
+        cfg = self.config.get("carry_forward", {})
+        return bool(cfg.get("enabled", True))
+
+    def _carry_forward_snapshots(self, session: Session, asof_date: date, *, updated_codes: set[str]) -> int:
+        cfg = self.config.get("carry_forward", {})
+        states = list(cfg.get("states", ["IN", "WATCH"]))
+        if not states:
+            return 0
+        state_rows = session.execute(select(FundUniverseState.code).where(FundUniverseState.state.in_(states))).all()
+        codes = [str(r[0]) for r in state_rows if r and r[0] is not None]
+        carried = 0
+        for code in codes:
+            if code in updated_codes:
+                continue
+            existing_today = session.scalar(
+                select(FundFeaturesSnapshot.id).where(
+                    and_(
+                        FundFeaturesSnapshot.code == code,
+                        FundFeaturesSnapshot.asof_date == asof_date,
+                    )
+                )
+            )
+            if existing_today is not None:
+                continue
+            prev = session.scalar(
+                select(FundFeaturesSnapshot)
+                .where(
+                    and_(
+                        FundFeaturesSnapshot.code == code,
+                        FundFeaturesSnapshot.asof_date < asof_date,
+                    )
+                )
+                .order_by(FundFeaturesSnapshot.asof_date.desc())
+                .limit(1)
+            )
+            if prev is None or not isinstance(prev.features, dict):
+                continue
+            features = dict(prev.features)
+            features["carried_forward"] = True
+            features["carried_from"] = prev.asof_date.isoformat()
+            self._upsert_snapshot(session, code, asof_date, features)
+            carried += 1
+        return carried

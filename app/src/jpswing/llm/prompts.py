@@ -13,14 +13,23 @@ def build_top10_messages(
     rules_payload: dict[str, Any],
 ) -> list[dict[str, str]]:
     system_prompt = (
-        "あなたは日本株スイング候補の評価アシスタントです。"
-        "与えられたJSON以外の事実は作らず、未取得情報は data_gaps に明示してください。"
-        "必ず厳格なJSONのみを返し、説明文やMarkdownを付けないでください。"
+        "You are a Japan equity swing-trade analysis assistant.\n"
+        "Return ONLY a JSON object matching the requested schema.\n"
+        "Write natural-language fields in Japanese.\n"
+        "Do not fabricate facts. If data is missing, put it in data_gaps.\n"
+        "Do not output empty thesis arrays.\n"
+        "Do not use placeholders such as N/A, unknown, or none for key levels."
     )
+
     user_prompt = {
-        "task": "Top30候補をTop10にランキングし、売買目安を短く作成する",
+        "task": "Rank Top30 candidates into Top10 for JP swing trading and provide concise rationale.",
         "report_date": report_date.isoformat(),
         "run_type": run_type,
+        "rules": [
+            "Use only provided candidate/event/market data.",
+            "thesis_bull and thesis_bear must each contain at least one short bullet.",
+            "key_levels.entry_idea/stop_idea/takeprofit_idea must be concrete text.",
+        ],
         "output_schema": {
             "top10": [
                 {

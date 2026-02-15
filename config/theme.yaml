@@ -4,18 +4,29 @@ schedule:
 
 seed_themes:
   - name: "半導体"
-    keywords: ["半導体", "fab", "wafer", "chip", "EUV"]
+    keywords: ["半導体", "半導体製造装置", "ファウンドリ", "fab", "wafer", "chip", "EUV"]
+    sector_keywords: ["半導体", "電気機器", "機械", "精密機器"]
+    shift_keywords: ["AI", "生成AI", "GPU", "データセンター", "EUV", "半導体"]
     allowed_sources: ["company_ir", "edinet"]
   - name: "防衛"
-    keywords: ["防衛", "security", "military", "aerospace"]
+    keywords: ["防衛", "防衛装備", "security", "military", "aerospace"]
+    sector_keywords: ["機械", "輸送用機器", "電気機器", "精密機器"]
+    shift_keywords: ["防衛", "防衛装備", "security", "military", "aerospace", "官公庁"]
     allowed_sources: ["company_ir", "edinet"]
   - name: "AIインフラ"
-    keywords: ["AI", "GPU", "datacenter", "inference", "LLM"]
+    keywords: ["AI", "生成AI", "GPU", "datacenter", "inference", "LLM", "クラウド", "データセンター"]
+    sector_keywords: ["情報・通信業", "電気機器", "サービス業"]
+    shift_keywords: ["AI", "生成AI", "LLM", "GPU", "データセンター", "クラウド", "推論", "学習"]
     allowed_sources: ["company_ir", "edinet"]
 
 mapping:
-  min_confidence: 0.50
-  boost_on_keyword_hits: 0.08
+  min_confidence: 0.24
+  name_keyword_boost: 0.08
+  sector_keyword_boost: 0.16
+  intel_keyword_boost: 0.20
+  business_shift_bonus: 0.20
+  intel_lookback_days: 180
+  intel_shift_min_hits: 2
   max_symbols_per_theme: 200
 
 daily_strength:

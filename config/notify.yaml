@@ -2,8 +2,12 @@ discord:
   webhooks:
     tech: ${DISCORD_WEBHOOK_TECH}
     fund_intel: ${DISCORD_WEBHOOK_FUND_INTEL}
+    fund_intel_flash: ${DISCORD_WEBHOOK_FUND_INTEL_FLASH}
+    fund_intel_detail: ${DISCORD_WEBHOOK_FUND_INTEL_DETAIL}
     proposals: ${DISCORD_WEBHOOK_PROPOSALS}
   threads:
     tech: null
     fund_intel: null
+    fund_intel_flash: null
+    fund_intel_detail: null
     proposals: null

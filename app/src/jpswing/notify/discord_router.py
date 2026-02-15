@@ -16,6 +16,8 @@ DEFAULT_MAX_EMBED_TEXT_PER_MESSAGE = 6000
 class Topic(str, Enum):
     TECH = "tech"
     FUND_INTEL = "fund_intel"
+    FUND_INTEL_FLASH = "fund_intel_flash"
+    FUND_INTEL_DETAIL = "fund_intel_detail"
     PROPOSALS = "proposals"
 
 
@@ -204,15 +206,25 @@ class DiscordRouter:
 
     @classmethod
     def from_config(cls, discord_cfg: Any, timeout_sec: int = 15) -> "DiscordRouter":
+        fund_intel_webhook = getattr(getattr(discord_cfg, "webhooks", object()), "fund_intel", "")
+        fund_intel_thread = getattr(getattr(discord_cfg, "threads", object()), "fund_intel", None)
         webhooks = {
             Topic.TECH.value: getattr(getattr(discord_cfg, "webhooks", object()), "tech", "")
             or getattr(discord_cfg, "webhook_url", ""),
-            Topic.FUND_INTEL.value: getattr(getattr(discord_cfg, "webhooks", object()), "fund_intel", ""),
+            Topic.FUND_INTEL.value: fund_intel_webhook,
+            Topic.FUND_INTEL_FLASH.value: getattr(getattr(discord_cfg, "webhooks", object()), "fund_intel_flash", "")
+            or fund_intel_webhook,
+            Topic.FUND_INTEL_DETAIL.value: getattr(getattr(discord_cfg, "webhooks", object()), "fund_intel_detail", "")
+            or fund_intel_webhook,
             Topic.PROPOSALS.value: getattr(getattr(discord_cfg, "webhooks", object()), "proposals", ""),
         }
         threads = {
             Topic.TECH.value: getattr(getattr(discord_cfg, "threads", object()), "tech", None),
-            Topic.FUND_INTEL.value: getattr(getattr(discord_cfg, "threads", object()), "fund_intel", None),
+            Topic.FUND_INTEL.value: fund_intel_thread,
+            Topic.FUND_INTEL_FLASH.value: getattr(getattr(discord_cfg, "threads", object()), "fund_intel_flash", None)
+            or fund_intel_thread,
+            Topic.FUND_INTEL_DETAIL.value: getattr(getattr(discord_cfg, "threads", object()), "fund_intel_detail", None)
+            or fund_intel_thread,
             Topic.PROPOSALS.value: getattr(getattr(discord_cfg, "threads", object()), "proposals", None),
         }
         return cls(webhooks=webhooks, threads=threads, timeout_sec=timeout_sec)

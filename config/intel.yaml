@@ -3,13 +3,42 @@ budget:
   morning_cap: 4
   close_cap: 6
 
+schedule:
+  enabled: true
+  cron: "*/20 * * * *"
+  session: "close"
+  run_on_holiday: true
+  use_previous_business_day_on_holiday: true
+
+recovery:
+  enabled: true
+  cron: "15 * * * 1-5"
+  lookback_business_days: 40
+  max_days_per_run: 3
+  mode: "close_only"
+  run_on_holiday: true
+
+processing:
+  process_all_candidates: true
+  pause_for_tech: true
+  pause_lead_minutes: 3
+
 search:
-  use_mcp: false
+  use_mcp: true
   mcp_server: ""
   mcp_endpoint: ""
+  mcp_plugin_ids: []
+  mcp_integrations: []
+  lmstudio_chat_endpoint: ""
+  mcp_context_length: 64000
   whitelist_domains:
+    - "api.edinet-fsa.go.jp"
+    - "disclosure.edinet-fsa.go.jp"
     - "disclosure2.edinet-fsa.go.jp"
     - "jpx.co.jp"
+  edinet_file_types: [5, 1, 2]
+  edinet_full_text_limit: 30000
+  ir_full_text_limit: 12000
   company_ir_domains: {}
   request_timeout_sec: 20
   max_items_per_symbol: 5
