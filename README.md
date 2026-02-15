@@ -198,3 +198,17 @@ Behavior:
   - content split at 2000 chars
   - embeds split to max 10 per message
 - Proposals channel posts only when proposals exist (no no-op messages)
+
+## pgvector Error Recovery
+
+If startup fails around `CREATE TABLE kb_chunks ... embedding VECTOR(1024)`:
+
+1. Recreate DB with the updated pgvector image:
+```powershell
+docker compose down -v
+docker compose up --build
+```
+2. If you must keep volume data, run extension creation manually once:
+```powershell
+docker compose exec postgres psql -U $env:POSTGRES_USER -d $env:POSTGRES_DB -c "CREATE EXTENSION IF NOT EXISTS vector;"
+```

@@ -2,7 +2,7 @@
 
 import logging
 import time
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from typing import Any
 
 import numpy as np
@@ -57,6 +57,19 @@ def _as_py(value: Any) -> Any:
     if isinstance(value, pd.Timestamp):
         return value.date()
     return value
+
+
+def _json_safe(value: Any) -> Any:
+    value = _as_py(value)
+    if isinstance(value, (date, datetime)):
+        return value.isoformat()
+    if isinstance(value, dict):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_json_safe(v) for v in value]
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return str(value)
 
 
 def _safe_get_latest_content(llm_response: dict[str, Any]) -> str:
@@ -147,6 +160,43 @@ class SwingPipeline:
             self.logger.info("Daily bars not ready yet. polling again in %ss", interval)
             time.sleep(interval)
 
+    def _load_cached_bars(self, target_dates: list[date]) -> pd.DataFrame:
+        if not target_dates:
+            return pd.DataFrame()
+        with self.db.session_scope() as session:
+            rows = session.execute(
+                select(
+                    DailyBar.trade_date,
+                    DailyBar.code,
+                    DailyBar.open,
+                    DailyBar.high,
+                    DailyBar.low,
+                    DailyBar.close,
+                    DailyBar.adj_close,
+                    DailyBar.volume,
+                    DailyBar.market_cap,
+                    DailyBar.raw_json,
+                ).where(DailyBar.trade_date.in_(target_dates))
+            ).all()
+        if not rows:
+            return pd.DataFrame()
+        records = [
+            {
+                "trade_date": row[0],
+                "code": str(row[1]),
+                "open": _as_py(row[2]),
+                "high": _as_py(row[3]),
+                "low": _as_py(row[4]),
+                "close": _as_py(row[5]),
+                "adj_close": _as_py(row[6]),
+                "volume": _as_py(row[7]),
+                "market_cap": _as_py(row[8]),
+                "raw_json": row[9] if isinstance(row[9], dict) else {},
+            }
+            for row in rows
+        ]
+        return pd.DataFrame(records)
+
     def run(self, run_type: str, report_date: date) -> dict[str, Any]:
         self.logger.info("Pipeline start run_type=%s report_date=%s", run_type, report_date)
         app_cfg = self.settings.app_config
@@ -159,7 +209,7 @@ class SwingPipeline:
                 trade_date = previous_business_day(report_date, calendar_rows)
             else:
                 if app_cfg.app.send_holiday_notice:
-                    content = f"譛ｬ譌･({report_date.isoformat()})縺ｯ莨大ｴ縺ｧ縺吶る夂衍繧偵せ繧ｭ繝・・縺励∪縺励◆縲・n{app_cfg.app.disclaimer}"
+                    content = f"本日({report_date.isoformat()})は休場です。処理をスキップしました。\n{app_cfg.app.disclaimer}"
                     self._send_and_log_notifications(report_date, run_type, [content])
                 return {"status": "holiday_skip", "report_date": report_date.isoformat()}
         else:
@@ -210,15 +260,60 @@ class SwingPipeline:
         normalized_master = [x for x in (normalize_instrument_row(r) for r in master_rows) if x]
         instruments_df = pd.DataFrame(normalized_master)
 
+        cached_bars_df = self._load_cached_bars(history_targets)
+        invalid_cached_dates: set[date] = set()
+        if not cached_bars_df.empty:
+            quality_df = cached_bars_df.copy()
+            quality_df["price_for_cache"] = pd.to_numeric(quality_df["adj_close"], errors="coerce").fillna(
+                pd.to_numeric(quality_df["close"], errors="coerce")
+            )
+            quality_df["volume_num"] = pd.to_numeric(quality_df["volume"], errors="coerce")
+            by_day = (
+                quality_df.groupby(pd.to_datetime(quality_df["trade_date"]).dt.date)
+                .agg(price_non_null=("price_for_cache", lambda s: int(s.notna().sum())))
+                .reset_index()
+            )
+            for _, row in by_day.iterrows():
+                if int(row.get("price_non_null", 0)) <= 0:
+                    invalid_cached_dates.add(row["trade_date"])
+            if invalid_cached_dates:
+                cached_bars_df = cached_bars_df[
+                    ~pd.to_datetime(cached_bars_df["trade_date"]).dt.date.isin(list(invalid_cached_dates))
+                ].copy()
+
+        cached_dates = (
+            set(pd.to_datetime(cached_bars_df["trade_date"]).dt.date.tolist()) if not cached_bars_df.empty else set()
+        )
+        missing_dates = [d for d in history_targets if (d not in cached_dates or d in invalid_cached_dates)]
+        # Always refresh trade_date once to keep latest value up to date.
+        if trade_date not in missing_dates:
+            missing_dates.append(trade_date)
+        self.logger.info(
+            "Daily bars incremental fetch: cache_days=%s invalid_cache_days=%s missing_days=%s",
+            len(cached_dates),
+            len(invalid_cached_dates),
+            len(missing_dates),
+        )
+
         bars_raw: list[dict[str, Any]] = []
-        for d in history_targets:
+        for d in missing_dates:
             rows = self._safe_fetch(f"daily_bars:{d.isoformat()}", lambda date=d: self.jquants.fetch_daily_bars(date))
             bars_raw.extend(rows)
-        normalized_bars = [x for x in (normalize_bar_row(r) for r in bars_raw) if x]
-        bars_df = pd.DataFrame(normalized_bars)
+        fetched_bars = [x for x in (normalize_bar_row(r) for r in bars_raw) if x]
+        fetched_bars_df = pd.DataFrame(fetched_bars)
+
+        if cached_bars_df.empty and fetched_bars_df.empty:
+            bars_df = pd.DataFrame()
+        elif cached_bars_df.empty:
+            bars_df = fetched_bars_df.copy()
+        elif fetched_bars_df.empty:
+            bars_df = cached_bars_df.copy()
+        else:
+            bars_df = pd.concat([cached_bars_df, fetched_bars_df], ignore_index=True)
+
         if bars_df.empty:
             self.logger.warning("No bars available for trade_date=%s", trade_date)
-            content = f"譬ｪ萓｡繝・・繧ｿ縺梧悴蜿門ｾ励・縺溘ａ蜃ｦ逅・ｒ荳ｭ譁ｭ縺励∪縺励◆: {trade_date.isoformat()}\n{self.settings.app_config.app.disclaimer}"
+            content = f"株価データが取得できないため処理を中断しました: {trade_date.isoformat()}\n{self.settings.app_config.app.disclaimer}"
             self._send_and_log_notifications(report_date, run_type, [content])
             return {"status": "no_bars", "trade_date": trade_date.isoformat()}
 
@@ -230,7 +325,7 @@ class SwingPipeline:
 
         universe_df = build_universe(latest_bars_df, instruments_df, rules, use_adj_close=use_adj_close)
         if universe_df.empty:
-            content = f"Step1騾夐℃驫俶氛縺・莉ｶ縺ｧ縺励◆: {trade_date.isoformat()}\n{self.settings.app_config.app.disclaimer}"
+            content = f"Step1通過銘柄が0件のため処理を終了しました: {trade_date.isoformat()}\n{self.settings.app_config.app.disclaimer}"
             self._send_and_log_notifications(report_date, run_type, [content])
             with self.db.session_scope() as session:
                 self._store_basic_data(
@@ -238,7 +333,7 @@ class SwingPipeline:
                     trade_date=trade_date,
                     rule_version=rule_version,
                     instruments_df=instruments_df,
-                    bars_df=bars_df,
+                    bars_df=fetched_bars_df,
                     latest_features_df=latest_features_df,
                     universe_df=universe_df,
                     top30_df=pd.DataFrame(),
@@ -387,7 +482,7 @@ class SwingPipeline:
                 trade_date=trade_date,
                 rule_version=rule_version,
                 instruments_df=instruments_df,
-                bars_df=bars_df,
+                bars_df=fetched_bars_df,
                 latest_features_df=latest_features_df,
                 universe_df=universe_df,
                 top30_df=top30_df,
@@ -603,7 +698,7 @@ class SwingPipeline:
                         "market": _as_py(r.get("market")),
                         "issued_shares": _as_py(r.get("issued_shares")),
                         "market_cap": _as_py(r.get("market_cap")),
-                        "raw_json": _as_py(r.get("raw_json")) or {},
+                        "raw_json": _json_safe(r.get("raw_json")) or {},
                     }
                     for r in instruments_df.to_dict("records")
                 ],
@@ -625,7 +720,7 @@ class SwingPipeline:
                         "adj_close": _as_py(r.get("adj_close")),
                         "volume": _as_py(r.get("volume")),
                         "market_cap": _as_py(r.get("market_cap")),
-                        "raw_json": _as_py(r.get("raw_json")) or {},
+                        "raw_json": _json_safe(r.get("raw_json")) or {},
                     }
                     for r in bars_df.to_dict("records")
                 ],
@@ -650,7 +745,7 @@ class SwingPipeline:
                         "volume_ratio20": _as_py(r.get("volume_ratio20")),
                         "breakout_strength20": _as_py(r.get("breakout_strength20")),
                         "volatility_penalty": _as_py(r.get("volatility_penalty")),
-                        "raw_json": {k: _as_py(v) for k, v in r.items()},
+                        "raw_json": _json_safe(r),
                     }
                     for r in latest_features_df.to_dict("records")
                 ],
@@ -667,7 +762,7 @@ class SwingPipeline:
                         "passed": True,
                         "market_cap": _as_py(r.get("market_cap_effective")),
                         "market_cap_estimated": bool(r.get("market_cap_estimated")),
-                        "details_json": _as_py(r.get("details_json")) or {},
+                        "details_json": _json_safe(r.get("details_json")) or {},
                         "rule_version": rule_version,
                     }
                     for r in universe_df.to_dict("records")
@@ -684,7 +779,7 @@ class SwingPipeline:
                         "code": str(r["code"]),
                         "rank": int(r["rank"]),
                         "score": float(r["score"]),
-                        "score_breakdown": _as_py(r.get("score_breakdown")) or {},
+                        "score_breakdown": _json_safe(r.get("score_breakdown")) or {},
                         "rule_version": rule_version,
                     }
                     for r in top30_df.to_dict("records")
@@ -701,7 +796,7 @@ class SwingPipeline:
                         "code": str(r["code"]),
                         "rank": int(r["rank"]),
                         "llm_run_id": llm_run_id,
-                        "reason_json": _as_py(r.get("reason_json")) or {},
+                        "reason_json": _json_safe(r.get("reason_json")) or {},
                         "rule_version": rule_version,
                     }
                     for r in shortlist_df.to_dict("records")
@@ -713,14 +808,25 @@ class SwingPipeline:
             MarketContextDaily(
                 trade_date=trade_date,
                 sq_week_flag=bool(market_context.get("sq_week_flag")),
-                context_json=market_context,
-                raw_json=market_raw,
+                context_json=_json_safe(market_context),
+                raw_json=_json_safe(market_raw),
             )
         )
 
         replace_rows_for_date(session, EventsDaily, trade_date)
         if events_rows:
-            session.bulk_insert_mappings(EventsDaily, events_rows)
+            session.bulk_insert_mappings(
+                EventsDaily,
+                [
+                    {
+                        "trade_date": row.get("trade_date"),
+                        "code": row.get("code"),
+                        "event_type": row.get("event_type"),
+                        "payload_json": _json_safe(row.get("payload_json")),
+                    }
+                    for row in events_rows
+                ],
+            )
 
     def _send_and_log_notifications(self, report_date: date, run_type: str, contents: list[str]) -> None:
         with self.db.session_scope() as session:
@@ -750,4 +856,5 @@ class SwingPipeline:
         except Exception:  # noqa: BLE001
             self.logger.exception("Fetch failed: %s", name)
             return []
+
 

@@ -1,4 +1,4 @@
-app:
+﻿app:
   timezone: "Asia/Tokyo"
   history_days: 120
   llm_input_lookback_days: 60
@@ -41,4 +41,3 @@ market:
   index_codes:
     - "NIKKEI225"
   usd_jpy_symbol: "USDJPY"
-

@@ -5,7 +5,8 @@ import pandas as pd
 
 
 def _rsi(series: pd.Series, period: int = 14) -> pd.Series:
-    delta = series.diff()
+    values = pd.to_numeric(series, errors="coerce")
+    delta = values.diff()
     gain = delta.clip(lower=0.0)
     loss = -delta.clip(upper=0.0)
     avg_gain = gain.rolling(window=period, min_periods=period).mean()
@@ -24,6 +25,8 @@ def compute_features(bars_df: pd.DataFrame, *, use_adj_close: bool = True) -> pd
 
     df = bars_df.copy()
     df = df.sort_values(["code", "trade_date"]).reset_index(drop=True)
+    for col in ("open", "high", "low", "close", "adj_close", "volume"):
+        df[col] = pd.to_numeric(df[col], errors="coerce")
 
     price_col = "adj_close" if use_adj_close else "close"
     group = df.groupby("code", sort=False)
@@ -49,4 +52,3 @@ def compute_features(bars_df: pd.DataFrame, *, use_adj_close: bool = True) -> pd
     df["breakout_strength20"] = (df[price_col] / rolling_high20.replace(0.0, np.nan)) - 1.0
     df["volatility_penalty"] = df["atr14"] / df[price_col].replace(0.0, np.nan)
     return df.drop(columns=["tr"])
-

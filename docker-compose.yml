@@ -1,6 +1,6 @@
-services:
+﻿services:
   postgres:
-    image: postgres:16
+    image: pgvector/pgvector:pg16
     container_name: jpswing-postgres
     environment:
       POSTGRES_USER: ${POSTGRES_USER:?set POSTGRES_USER in .env}
@@ -34,3 +34,4 @@ services:
 
 volumes:
   pgdata:
+

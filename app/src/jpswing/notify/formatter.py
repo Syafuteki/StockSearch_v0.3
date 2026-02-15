@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from datetime import date
 from typing import Any
@@ -60,11 +60,11 @@ def format_report_message(
     if run_type == "morning":
         title = f"【08:00】今日の注目Top10（{report_date.isoformat()} / 前日終値基準）"
     else:
-        title = f"【引け後】Top10（{report_date.isoformat()} / 本日終値確定）"
+        title = f"【引け後】Top10（{report_date.isoformat()} / 当日終値確定）"
 
     lines = [title]
     lines.append(
-        "注意イベント: "
+        "注目イベント: "
         f"{_tag_label('earnings', '決算')}={event_summary.get('earnings', 0)}件 "
         f"{_tag_label('margin_alert', '信用規制')}={event_summary.get('margin_alert', 0)}件 "
         f"{_tag_label('short_sale', '空売り')}={event_summary.get('short_sale_report', 0)}件"

@@ -1,10 +1,11 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from contextlib import contextmanager
 from datetime import date
 from typing import Any
+import logging
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete, select, text
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy import create_engine
@@ -16,8 +17,16 @@ class DBSessionManager:
     def __init__(self, database_url: str, echo: bool = False) -> None:
         self.engine: Engine = create_engine(database_url, echo=echo, future=True)
         self._session_factory = sessionmaker(bind=self.engine, autoflush=False, autocommit=False, future=True)
+        self.logger = logging.getLogger(self.__class__.__name__)
 
     def init_schema(self) -> None:
+        # Ensure pgvector extension exists before creating VECTOR columns.
+        if self.engine.dialect.name == "postgresql":
+            try:
+                with self.engine.begin() as conn:
+                    conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
+            except Exception as exc:  # noqa: BLE001
+                self.logger.warning("Failed to enable pgvector extension: %s", exc)
         Base.metadata.create_all(self.engine)
 
     @contextmanager
@@ -59,4 +68,3 @@ def get_latest_shortlist_codes_before(session: Session, model: Any, target_date:
         return set()
     rows = session.execute(select(code_col).where(date_col == latest_date, rule_col == rule_version)).all()
     return {row[0] for row in rows}
-

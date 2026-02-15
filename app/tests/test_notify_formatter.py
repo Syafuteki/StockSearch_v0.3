@@ -1,4 +1,4 @@
-from datetime import date
+﻿from datetime import date
 
 import pandas as pd
 
@@ -21,11 +21,11 @@ def test_format_report_message_contains_disclaimer_and_title() -> None:
     )
     llm_map = {
         "7203": {
-            "thesis_bull": ["出来高伴う上放れ"],
+            "thesis_bull": ["出来高増加", "上方修正期待"],
             "thesis_bear": ["地合い悪化"],
             "key_levels": {
-                "entry_idea": "前日高値超え",
-                "stop_idea": "ATR下",
+                "entry_idea": "前日高値ブレイク",
+                "stop_idea": "ATR基準",
                 "takeprofit_idea": "2R",
             },
             "event_risks": ["決算"],
@@ -45,4 +45,3 @@ def test_format_report_message_contains_disclaimer_and_title() -> None:
     assert msgs
     assert "今日の注目Top10" in msgs[0]
     assert "免責文" in msgs[-1]
-

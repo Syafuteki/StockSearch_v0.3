@@ -1,6 +1,6 @@
-tags:
+﻿tags:
   earnings:
-    emoji: "🗓️"
+    emoji: "📅"
     severity: "high"
     order: 10
     label: "決算"
@@ -15,8 +15,7 @@ tags:
     order: 30
     label: "空売り"
   sq_week:
-    emoji: "🧭"
+    emoji: "🗓️"
     severity: "medium"
     order: 40
     label: "SQ週"
-
