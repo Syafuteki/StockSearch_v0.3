@@ -59,3 +59,62 @@ class LlmTop10Item(BaseModel):
 
 class LlmTop10Response(BaseModel):
     top10: list[LlmTop10Item] = Field(min_length=1, max_length=10)
+
+
+def _normalize_text_optional(value: str | None) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _normalize_text_list(value: list[str] | None) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    out: list[str] = []
+    for item in value:
+        text = _normalize_text_optional(item)
+        if not text:
+            continue
+        out.append(text)
+    return out
+
+
+class SingleCandidateKeyLevels(BaseModel):
+    entry_idea: str | None = None
+    stop_idea: str | None = None
+    takeprofit_idea: str | None = None
+
+    @field_validator("entry_idea", "stop_idea", "takeprofit_idea", mode="before")
+    @classmethod
+    def _coerce_text(cls, value: object) -> str | None:
+        if value is None:
+            return None
+        return _normalize_text_optional(str(value))
+
+
+class LlmSingleCandidateResponse(BaseModel):
+    thesis_bull: list[str] = Field(default_factory=list)
+    thesis_bear: list[str] = Field(default_factory=list)
+    key_levels: SingleCandidateKeyLevels = Field(default_factory=SingleCandidateKeyLevels)
+    event_risks: list[str] = Field(default_factory=list)
+    confidence_0_100: int | None = Field(default=None, ge=0, le=100)
+    data_gaps: list[str] = Field(default_factory=list)
+    rule_suggestion: str | None = None
+
+    @field_validator("thesis_bull", "thesis_bear", "event_risks", "data_gaps", mode="before")
+    @classmethod
+    def _normalize_list_fields(cls, value: object) -> list[str]:
+        if isinstance(value, list):
+            return _normalize_text_list(value)
+        if value is None:
+            return []
+        text = _normalize_text_optional(str(value))
+        return [text] if text else []
+
+    @field_validator("rule_suggestion", mode="before")
+    @classmethod
+    def _normalize_rule_suggestion(cls, value: object) -> str | None:
+        if value is None:
+            return None
+        return _normalize_text_optional(str(value))

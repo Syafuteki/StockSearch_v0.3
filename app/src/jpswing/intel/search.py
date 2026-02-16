@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import json
 import logging
 import re
 import zipfile
@@ -92,6 +93,75 @@ def _has_substantive_snippet(snippet: str, headline: str) -> bool:
     if s.startswith(h) and len(s) <= len(h) + 8:
         return False
     return len(s) >= 24
+
+
+def _is_expected_edinet_payload(payload: bytes, file_type: int) -> bool:
+    if not payload:
+        return False
+    if file_type == 2:
+        return payload.startswith(b"%PDF-")
+    if file_type in {1, 3, 4, 5}:
+        return payload.startswith(b"PK")
+    # Unknown type: keep previous behavior.
+    return True
+
+
+def _looks_like_edinet_api_error_payload(payload: bytes) -> bool:
+    if not payload:
+        return True
+    head = payload[:12000]
+    stripped = head.lstrip()
+    if not stripped:
+        return True
+    if stripped.startswith((b"{", b"[")):
+        txt = _decode_bytes(stripped)
+        low = txt.lower()
+        if any(
+            token in low
+            for token in (
+                "not found",
+                "invalid_api_key",
+                "subscription-key",
+                "access denied",
+                "forbidden",
+                "wzek0130.aspx",
+            )
+        ):
+            return True
+        try:
+            obj = json.loads(txt)
+        except Exception:
+            return _looks_like_error_snippet(txt)
+        if isinstance(obj, dict):
+            msg = str(obj.get("message") or "")
+            err = obj.get("error")
+            code = str(obj.get("code") or "")
+            detail = str(obj.get("detail") or "")
+            probe = " ".join(
+                [
+                    msg,
+                    str(err) if err is not None else "",
+                    code,
+                    detail,
+                ]
+            ).lower()
+            if any(
+                token in probe
+                for token in (
+                    "not found",
+                    "invalid_api_key",
+                    "subscription-key",
+                    "forbidden",
+                    "access denied",
+                    "wzek0130.aspx",
+                )
+            ):
+                return True
+        return False
+    if stripped.startswith(b"<"):
+        txt = _decode_bytes(stripped)
+        return _looks_like_error_snippet(txt)
+    return False
 
 
 def _decode_bytes(raw: bytes) -> str:
@@ -284,6 +354,18 @@ class DefaultIntelSearchBackend(IntelSearchBackend):
                         code,
                         doc_id,
                         file_type,
+                    )
+                    continue
+                if not _is_expected_edinet_payload(payload, file_type):
+                    head_text = _safe_text(_decode_bytes(payload[:1200]), limit=180)
+                    self.logger.warning(
+                        "EDINET payload mismatch code=%s doc_id=%s type=%s magic=%s looks_error=%s head=%s",
+                        code,
+                        doc_id,
+                        file_type,
+                        payload[:8].hex(),
+                        _looks_like_edinet_api_error_payload(payload),
+                        head_text,
                     )
                     continue
 

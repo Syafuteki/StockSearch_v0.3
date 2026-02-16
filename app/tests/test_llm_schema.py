@@ -1,4 +1,4 @@
-from jpswing.llm.validator import validate_llm_output
+from jpswing.llm.validator import validate_llm_output, validate_single_candidate_output
 
 
 def test_validate_llm_output_success() -> None:
@@ -65,3 +65,55 @@ def test_validate_llm_output_accepts_gpt_oss_control_prefix() -> None:
     assert model is not None
     assert payload is not None
     assert model.top10[0].code == "72030"
+
+
+def test_validate_single_candidate_output_accepts_object_schema() -> None:
+    content = """
+    {
+      "thesis_bull": ["需給改善が続く場合の上昇余地"],
+      "thesis_bear": ["イベント直後の反落リスク"],
+      "key_levels": {
+        "entry_idea": "高値更新でエントリー",
+        "stop_idea": "直近安値割れ",
+        "takeprofit_idea": "2Rで分割利確"
+      },
+      "event_risks": ["決算イベント"],
+      "confidence_0_100": 68,
+      "data_gaps": [],
+      "rule_suggestion": null
+    }
+    """
+    model, err, payload = validate_single_candidate_output(content)
+    assert err is None
+    assert model is not None
+    assert payload is not None
+    assert model["confidence_0_100"] == 68
+
+
+def test_validate_single_candidate_output_accepts_legacy_top10_wrapper() -> None:
+    content = """
+    {
+      "top10": [
+        {
+          "code": "72030",
+          "top10_rank": 1,
+          "thesis_bull": ["材料継続"],
+          "thesis_bear": ["反落リスク"],
+          "key_levels": {
+            "entry_idea": "高値更新",
+            "stop_idea": "直近安値割れ",
+            "takeprofit_idea": "2R利確"
+          },
+          "event_risks": [],
+          "confidence_0_100": 70,
+          "data_gaps": [],
+          "rule_suggestion": null
+        }
+      ]
+    }
+    """
+    model, err, payload = validate_single_candidate_output(content)
+    assert err is None
+    assert model is not None
+    assert payload is not None
+    assert model["confidence_0_100"] == 70

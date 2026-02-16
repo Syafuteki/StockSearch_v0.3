@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 import logging
 import threading
-from datetime import date
+from datetime import date, datetime
 from zoneinfo import ZoneInfo
 
 from apscheduler.schedulers.blocking import BlockingScheduler
@@ -18,6 +18,8 @@ from jpswing.utils.time import today_jst
 
 
 _SCHEDULER_MUTEX = threading.Lock()
+_STARTUP_CATCHUP_MUTEX = threading.Lock()
+_STARTUP_CATCHUP_PHASE = "done"  # tech -> fund -> done
 
 
 def _parse_args() -> argparse.Namespace:
@@ -33,6 +35,7 @@ def _parse_args() -> argparse.Namespace:
             "fund_weekly",
             "fund_daily",
             "fund_backfill",
+            "fund_auto_recover",
             "theme_weekly",
             "theme_daily",
             "intel_background",
@@ -71,6 +74,70 @@ def _parse_date(raw: str | None) -> date:
     return date.fromisoformat(raw)
 
 
+def _get_startup_catchup_phase() -> str:
+    with _STARTUP_CATCHUP_MUTEX:
+        return _STARTUP_CATCHUP_PHASE
+
+
+def _set_startup_catchup_phase(phase: str) -> None:
+    global _STARTUP_CATCHUP_PHASE
+    with _STARTUP_CATCHUP_MUTEX:
+        _STARTUP_CATCHUP_PHASE = phase
+
+
+def _is_startup_catchup_done() -> bool:
+    return _get_startup_catchup_phase() == "done"
+
+
+def _is_recovery_phase_complete(result: dict[str, object]) -> bool:
+    status = str(result.get("status", "")).strip()
+    if status in {"disabled", "no_gap", "no_business_days", "no_target", "holiday_skip"}:
+        return True
+    if status != "ok":
+        return False
+    missing_days = int(result.get("missing_days", 0) or 0)
+    repaired_days = int(result.get("repaired_days", 0) or 0)
+    return missing_days <= repaired_days
+
+
+def _should_pause_startup_catchup(pipeline: SwingPipeline, report_date: date) -> bool:
+    cfg = pipeline.settings.intel_config.get("startup_catchup", {})
+    if not bool(cfg.get("enabled", True)):
+        return False
+    lead_minutes = max(0, int(cfg.get("pause_lead_minutes", 3)))
+    if lead_minutes <= 0:
+        return False
+
+    tz_name = str(pipeline.settings.app_config.scheduler.timezone or "Asia/Tokyo")
+    tz = ZoneInfo(tz_name)
+    now = datetime.now(tz)
+    if now.date() != report_date:
+        return False
+    lead_sec = lead_minutes * 60
+
+    fund_cfg = pipeline.settings.fund_config.get("schedule", {})
+    cron_exprs = [
+        str(pipeline.settings.app_config.scheduler.morning_cron or "").strip(),
+        str(pipeline.settings.app_config.scheduler.close_cron or "").strip(),
+        str(fund_cfg.get("weekly_cron", "0 7 * * 1")).strip(),
+        str(fund_cfg.get("daily_refresh_cron", "10 7 * * 1-5")).strip(),
+    ]
+    for expr in cron_exprs:
+        if not expr:
+            continue
+        try:
+            trigger = CronTrigger.from_crontab(expr, timezone=tz)
+            next_fire = trigger.get_next_fire_time(None, now)
+        except Exception:  # noqa: BLE001
+            continue
+        if next_fire is None:
+            continue
+        delta = (next_fire - now).total_seconds()
+        if 0 <= delta <= lead_sec:
+            return True
+    return False
+
+
 def _run_job(pipeline: SwingPipeline, run_type: str) -> None:
     def _do() -> None:
         report_date = today_jst()
@@ -103,6 +170,12 @@ def _run_intel_background_job(pipeline: SwingPipeline) -> None:
     def _do() -> None:
         report_date = today_jst()
         log = logging.getLogger(__name__)
+        if not _is_startup_catchup_done():
+            log.info(
+                "Scheduled intel background skipped until startup catch-up completes. phase=%s",
+                _get_startup_catchup_phase(),
+            )
+            return
         log.info("Scheduled intel background start date=%s", report_date)
         result = pipeline.run_intel_background(report_date)
         log.info("Scheduled intel background end result=%s", result)
@@ -119,6 +192,74 @@ def _run_auto_recover_job(pipeline: SwingPipeline) -> None:
         log.info("Scheduled auto recover end result=%s", result)
 
     _run_serialized("auto_recover", _do)
+
+
+def _run_startup_catchup_step_job(pipeline: SwingPipeline) -> None:
+    def _do() -> None:
+        logger = logging.getLogger(__name__)
+        report_date = today_jst()
+        phase = _get_startup_catchup_phase()
+        if phase == "done":
+            return
+        if _should_pause_startup_catchup(pipeline, report_date):
+            logger.info("Startup catch-up paused for upcoming TECH/FUND window. phase=%s", phase)
+            return
+
+        while True:
+            if _should_pause_startup_catchup(pipeline, report_date):
+                logger.info("Startup catch-up paused for upcoming TECH/FUND window. phase=%s", _get_startup_catchup_phase())
+                return
+            phase = _get_startup_catchup_phase()
+            if phase == "done":
+                return
+            if phase == "tech":
+                logger.info("Startup catch-up step start phase=tech date=%s", report_date)
+                result = pipeline.run_auto_recover(report_date)
+                logger.info("Startup catch-up step end phase=tech result=%s", result)
+                if _is_recovery_phase_complete(result):
+                    fund_recovery_cfg = pipeline.settings.fund_config.get("recovery", {})
+                    if bool(fund_recovery_cfg.get("run_on_startup", True)):
+                        _set_startup_catchup_phase("fund")
+                    else:
+                        _set_startup_catchup_phase("done")
+                    continue
+                return
+            if phase == "fund":
+                logger.info("Startup catch-up step start phase=fund date=%s", report_date)
+                result = pipeline.fund_intel_orchestrator.run_fund_auto_recover(report_date=report_date)
+                logger.info("Startup catch-up step end phase=fund result=%s", result)
+                if _is_recovery_phase_complete(result):
+                    _set_startup_catchup_phase("done")
+                    logger.info("Startup catch-up completed")
+                return
+            logger.warning("Unknown startup catch-up phase: %s", phase)
+            _set_startup_catchup_phase("done")
+            return
+
+    _run_serialized("startup_catchup", _do)
+
+
+def _init_startup_catchup_state(pipeline: SwingPipeline) -> None:
+    logger = logging.getLogger(__name__)
+    cfg = pipeline.settings.intel_config.get("startup_catchup", {})
+    enabled = bool(cfg.get("enabled", True))
+    tech_recovery_cfg = pipeline.settings.intel_config.get("recovery", {})
+    fund_recovery_cfg = pipeline.settings.fund_config.get("recovery", {})
+    tech_on_startup = bool(tech_recovery_cfg.get("run_on_startup", True))
+    fund_on_startup = bool(fund_recovery_cfg.get("run_on_startup", True))
+    if enabled and (tech_on_startup or fund_on_startup):
+        if tech_on_startup:
+            _set_startup_catchup_phase("tech")
+            logger.info("Startup catch-up initialized phase=tech")
+        else:
+            _set_startup_catchup_phase("fund")
+            logger.info("Startup catch-up initialized phase=fund")
+    elif enabled:
+        _set_startup_catchup_phase("done")
+        logger.info("Startup catch-up disabled by run_on_startup flags")
+    else:
+        _set_startup_catchup_phase("done")
+        logger.info("Startup catch-up disabled by config")
 
 
 def main() -> None:
@@ -141,6 +282,8 @@ def main() -> None:
                     result = pipeline.fund_intel_orchestrator.run_fund_daily_refresh(business_date=report_date)
                 elif rt == "fund_backfill":
                     result = pipeline.fund_intel_orchestrator.run_fund_backfill(business_date=report_date)
+                elif rt == "fund_auto_recover":
+                    result = pipeline.fund_intel_orchestrator.run_fund_auto_recover(report_date=report_date)
                 elif rt == "theme_weekly":
                     result = pipeline.fund_intel_orchestrator.run_theme_weekly(business_date=report_date)
                 elif rt == "intel_background":
@@ -175,6 +318,7 @@ def main() -> None:
                 logger.info("One-shot result run_type=%s result=%s", rt, result)
             return
 
+        _init_startup_catchup_state(pipeline)
         tz = ZoneInfo(settings.app_config.scheduler.timezone)
         scheduler = BlockingScheduler(
             timezone=tz,
@@ -244,6 +388,15 @@ def main() -> None:
                 CronTrigger.from_crontab(str(recovery_cfg.get("cron", "15 * * * 1-5")), timezone=tz),
                 args=[pipeline],
                 id="auto_recover_job",
+                replace_existing=True,
+            )
+        startup_catchup_cfg = settings.intel_config.get("startup_catchup", {})
+        if bool(startup_catchup_cfg.get("enabled", True)):
+            scheduler.add_job(
+                _run_startup_catchup_step_job,
+                CronTrigger.from_crontab(str(startup_catchup_cfg.get("cron", "*/2 * * * *")), timezone=tz),
+                args=[pipeline],
+                id="startup_catchup_job",
                 replace_existing=True,
             )
         logger.info("Scheduler started timezone=%s", tz)

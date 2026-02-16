@@ -4,8 +4,6 @@ from jpswing.intel.schema import validate_intel_payload
 def test_intel_schema_validation_rejects_missing_required_fields() -> None:
     payload = {
         "headline": "test",
-        "published_at": None,
-        "source_type": "edinet",
         "facts": [],
         "tags": [],
         "risk_flags": [],
@@ -22,9 +20,6 @@ def test_intel_schema_validation_rejects_missing_required_fields() -> None:
 def test_intel_schema_validation_accepts_valid_payload() -> None:
     payload = {
         "headline": "test",
-        "published_at": "2026-02-14",
-        "source_url": "https://example.com",
-        "source_type": "edinet",
         "summary": "ok",
         "facts": ["fact1"],
         "tags": ["buyback"],
@@ -37,4 +32,3 @@ def test_intel_schema_validation_accepts_valid_payload() -> None:
     assert result.valid
     assert result.payload is not None
     assert result.error is None
-

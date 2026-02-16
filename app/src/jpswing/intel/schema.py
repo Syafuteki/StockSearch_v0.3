@@ -12,9 +12,7 @@ INTEL_ITEM_SCHEMA: dict[str, Any] = {
     "additionalProperties": False,
     "required": [
         "headline",
-        "published_at",
-        "source_url",
-        "source_type",
+        "summary",
         "facts",
         "tags",
         "risk_flags",
@@ -24,10 +22,10 @@ INTEL_ITEM_SCHEMA: dict[str, Any] = {
     ],
     "properties": {
         "headline": {"type": "string", "minLength": 1},
+        "summary": {"type": "string", "minLength": 1},
         "published_at": {"type": ["string", "null"]},
-        "source_url": {"type": "string", "minLength": 1},
-        "source_type": {"type": "string", "minLength": 1},
-        "summary": {"type": "string"},
+        "source_url": {"type": "string"},
+        "source_type": {"type": "string"},
         "facts": {"type": "array", "items": {"type": "string"}},
         "tags": {"type": "array", "items": {"type": "string"}},
         "risk_flags": {"type": "array", "items": {"type": "string"}},
@@ -65,4 +63,3 @@ def parse_published_at(value: str | None) -> datetime | None:
         except ValueError:
             continue
     return None
-

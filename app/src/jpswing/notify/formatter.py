@@ -41,6 +41,20 @@ def _safe_level_text(value: Any, *, fallback: str = "未取得") -> str:
     return text
 
 
+def _is_tech_fallback(llm: dict[str, Any] | None) -> bool:
+    if not isinstance(llm, dict):
+        return True
+    data_gaps = llm.get("data_gaps")
+    if isinstance(data_gaps, list):
+        for gap in data_gaps:
+            if str(gap or "").strip() == "llm_output_invalid_or_missing":
+                return True
+    suggestion = str(llm.get("rule_suggestion") or "").strip()
+    if suggestion.lower().startswith("fallback:"):
+        return True
+    return False
+
+
 def split_messages(text: str, max_chars: int, max_parts: int) -> list[str]:
     if len(text) <= max_chars:
         return [text]
@@ -130,6 +144,8 @@ def format_report_message(
         )
         lines.append(f"注意イベント: {' / '.join(events) if events else '特記事項なし'}")
         lines.append(f"自信度: {confidence}")
+        if _is_tech_fallback(llm):
+            lines.append("備考: LLMフォールバック結果")
 
     lines.append(disclaimer)
     body = "\n".join(lines).strip()

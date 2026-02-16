@@ -20,12 +20,13 @@ from jpswing.db.models import (
     IntelQueue,
     IntelRuleSuggestion,
     Notification,
+    FundFeaturesSnapshot,
     ThemeStrengthDaily,
     ThemeSymbolMap,
 )
 from jpswing.db.session import DBSessionManager
 from jpswing.fund.service import FundService
-from jpswing.ingest.calendar import business_days_in_range
+from jpswing.ingest.calendar import business_days_in_range, is_business_day, previous_business_day
 from jpswing.ingest.edinet_client import EdinetClient
 from jpswing.ingest.jquants_client import JQuantsClient
 from jpswing.intel.llm_client import IntelLlmClient
@@ -299,6 +300,7 @@ class FundIntelOrchestrator:
                     master_rows=master_rows,
                     carry_forward=False,
                 )
+                session.flush()
                 changed_count = len([c for c in changes if c.changed])
                 total_changed += changed_count
                 total_rows += len(changes)
@@ -345,6 +347,108 @@ class FundIntelOrchestrator:
                 force=False,
             )
             return {"status": "ok", "changes": len([c for c in changes if c.changed])}
+
+    def run_fund_auto_recover(self, *, report_date: date) -> dict[str, Any]:
+        cfg = self.settings.fund_config.get("recovery", {})
+        if not bool(cfg.get("enabled", False)):
+            return {"status": "disabled"}
+
+        lookback_business_days = max(1, int(cfg.get("lookback_business_days", 40)))
+        max_days_per_run = max(1, int(cfg.get("max_days_per_run", 3)))
+        run_on_holiday = bool(cfg.get("run_on_holiday", True))
+        force = bool(cfg.get("force", False))
+        interval_sec = float(cfg.get("request_interval_sec", 0.0))
+
+        horizon_days = max(lookback_business_days * 4, 120)
+        cal_from = report_date - timedelta(days=horizon_days)
+        calendar_rows = self.jquants.fetch_calendar(cal_from, report_date + timedelta(days=14))
+        business_today = is_business_day(report_date, calendar_rows)
+        if not business_today and not run_on_holiday:
+            return {
+                "status": "holiday_skip",
+                "report_date": report_date.isoformat(),
+                "reason": "run_on_holiday=false",
+            }
+
+        if business_today:
+            end_date = report_date
+        else:
+            end_date = previous_business_day(report_date, calendar_rows)
+
+        biz_days = business_days_in_range(calendar_rows, end_date - timedelta(days=horizon_days), end_date)
+        if len(biz_days) > lookback_business_days:
+            biz_days = biz_days[-lookback_business_days:]
+        if not biz_days:
+            return {"status": "no_business_days"}
+
+        with self.db.session_scope() as session:
+            if not try_advisory_xact_lock(session, f"fund_auto_recover:{report_date}"):
+                return {"status": "locked"}
+            done_rows = session.execute(
+                select(FundFeaturesSnapshot.asof_date)
+                .where(
+                    FundFeaturesSnapshot.asof_date >= biz_days[0],
+                    FundFeaturesSnapshot.asof_date <= biz_days[-1],
+                )
+                .distinct()
+            ).all()
+            done_dates = {r[0] for r in done_rows if r and r[0] is not None}
+
+            missing_dates = [d for d in biz_days if d not in done_dates]
+            if not missing_dates:
+                return {
+                    "status": "no_gap",
+                    "from": biz_days[0].isoformat(),
+                    "to": biz_days[-1].isoformat(),
+                    "checked_days": len(biz_days),
+                }
+
+            targets = missing_dates[:max_days_per_run]
+            self.logger.info(
+                "Fund auto recover start report_date=%s force=%s targets=%s",
+                report_date,
+                force,
+                [d.isoformat() for d in targets],
+            )
+            details: list[dict[str, Any]] = []
+            for idx, d in enumerate(targets, start=1):
+                changes = self.fund_service.refresh_states(
+                    session,
+                    business_date=d,
+                    jquants=self.jquants,
+                    force=force,
+                )
+                session.flush()
+                changed_count = len([c for c in changes if c.changed])
+                details.append(
+                    {
+                        "date": d.isoformat(),
+                        "rows": len(changes),
+                        "changes": changed_count,
+                    }
+                )
+                if idx % 20 == 0 or idx == len(targets):
+                    self.logger.info(
+                        "Fund auto recover progress: %s/%s day=%s rows=%s changed=%s",
+                        idx,
+                        len(targets),
+                        d,
+                        len(changes),
+                        changed_count,
+                    )
+                if interval_sec > 0:
+                    import time
+
+                    time.sleep(interval_sec)
+
+            return {
+                "status": "ok",
+                "report_date": report_date.isoformat(),
+                "checked_days": len(biz_days),
+                "missing_days": len(missing_dates),
+                "repaired_days": len(targets),
+                "details": details,
+            }
 
     def run_theme_weekly(self, *, business_date: date) -> dict[str, Any]:
         with self.db.session_scope() as session:

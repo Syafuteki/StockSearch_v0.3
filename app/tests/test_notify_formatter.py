@@ -112,3 +112,40 @@ def test_format_report_message_fallbacks_when_llm_values_are_empty() -> None:
     assert "上昇シナリオ: 未取得" in msgs[0]
     assert "下落シナリオ: 未取得" in msgs[0]
     assert "目安: エントリー=未取得 / 利確=未取得 / 損切り=未取得" in msgs[0]
+
+
+def test_format_report_message_shows_fallback_note_for_tech() -> None:
+    top10_df = pd.DataFrame(
+        [
+            {
+                "code": "72030",
+                "name": "Sample",
+                "rank": 1,
+                "ma25": 1.0,
+                "roc20": 0.1,
+                "volume_ratio20": 1.2,
+                "breakout_strength20": 0.01,
+            }
+        ]
+    )
+    llm_map = {
+        "72030": {
+            "thesis_bull": ["上昇余地あり"],
+            "thesis_bear": ["反落リスク"],
+            "key_levels": {"entry_idea": "高値更新", "stop_idea": "直近安値割れ", "takeprofit_idea": "2R"},
+            "confidence_0_100": 65,
+            "data_gaps": ["llm_output_invalid_or_missing"],
+        }
+    }
+    msgs = format_report_message(
+        report_date=date(2026, 2, 14),
+        run_type="morning",
+        top10_df=top10_df,
+        llm_map=llm_map,
+        event_summary={"earnings": 0, "margin_alert": 0, "short_sale_report": 0},
+        disclaimer="免責文",
+        max_chars=2000,
+        max_parts=2,
+    )
+    assert msgs
+    assert "備考: LLMフォールバック結果" in msgs[0]

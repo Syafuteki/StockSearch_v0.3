@@ -12,11 +12,17 @@ schedule:
 
 recovery:
   enabled: true
+  run_on_startup: true
   cron: "15 * * * 1-5"
   lookback_business_days: 40
   max_days_per_run: 3
   mode: "close_only"
   run_on_holiday: true
+
+startup_catchup:
+  enabled: true
+  cron: "*/2 * * * *"
+  pause_lead_minutes: 3
 
 processing:
   process_all_candidates: true
@@ -36,7 +42,7 @@ search:
     - "disclosure.edinet-fsa.go.jp"
     - "disclosure2.edinet-fsa.go.jp"
     - "jpx.co.jp"
-  edinet_file_types: [5, 1, 2]
+  edinet_file_types: [1, 2, 5, 3]
   edinet_full_text_limit: 30000
   ir_full_text_limit: 12000
   company_ir_domains: {}

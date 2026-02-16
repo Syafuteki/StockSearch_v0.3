@@ -170,3 +170,34 @@ def test_default_intel_search_fallbacks_when_primary_is_error_page() -> None:
     assert rows[0].source_url.endswith("type=1")
     assert "buyback details" in rows[0].snippet
     assert rows[0].full_text
+
+
+def test_default_intel_search_skips_json_error_payload_even_when_status_is_200() -> None:
+    # Simulate EDINET returning JSON error body for a document type that should be binary.
+    primary_json_error = b'{"message":"Not Found\\u985e\\u3092\\u53d6\\u5f97\\u3059\\u308b\\u305f\\u3081\\u306eAPI"}'
+    secondary_html = _zip_payload(
+        {
+            "PublicDoc/main.htm": (
+                "<html><body><h1>Disclosure</h1>"
+                "<p>This filing contains concrete timeline and revision details.</p></body></html>"
+            )
+        }
+    )
+    dummy = _DummyEdinetClient({2: primary_json_error, 1: secondary_html})
+    backend = DefaultIntelSearchBackend(
+        edinet_client=dummy,
+        whitelist_domains=["api.edinet-fsa.go.jp"],
+        company_ir_domains={},
+        timeout_sec=5,
+        max_items_per_symbol=5,
+        edinet_file_types=[2, 1],
+    )
+    rows = backend.fetch(
+        code="36790",
+        business_date=date(2026, 2, 13),
+        seed={"edinet_docs": [{"docID": "S100TEST", "docDescription": "Test filing", "submitDate": "2026-02-13"}]},
+    )
+    assert len(rows) == 1
+    assert dummy.calls == [("S100TEST", 2), ("S100TEST", 1)]
+    assert rows[0].source_url.endswith("type=1")
+    assert "timeline" in rows[0].snippet

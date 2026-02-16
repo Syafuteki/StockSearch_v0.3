@@ -36,8 +36,8 @@ from jpswing.ingest.fx_client import FxClient
 from jpswing.ingest.jquants_client import JQuantsClient
 from jpswing.ingest.transformers import normalize_bar_row, normalize_instrument_row
 from jpswing.llm.client import LlmClient
-from jpswing.llm.prompts import build_top10_messages
-from jpswing.llm.validator import validate_llm_output
+from jpswing.llm.prompts import build_single_candidate_messages, build_single_candidate_repair_messages
+from jpswing.llm.validator import validate_single_candidate_output
 from jpswing.notify.discord_router import DiscordRouter, Topic
 from jpswing.notify.formatter import format_report_message
 from jpswing.screening.step1 import build_universe
@@ -83,6 +83,183 @@ def _safe_get_latest_content(llm_response: dict[str, Any]) -> str:
     if not isinstance(content, str):
         return ""
     return content
+
+
+_TEXT_PLACEHOLDERS = {
+    "",
+    "-",
+    "n/a",
+    "na",
+    "none",
+    "null",
+    "unknown",
+    "tbd",
+    "not available",
+    "not_applicable",
+    "未取得",
+}
+
+
+def _is_placeholder_text(value: Any) -> bool:
+    text = str(value or "").strip().lower()
+    return text in _TEXT_PLACEHOLDERS
+
+
+def _as_float(value: Any) -> float | None:
+    try:
+        if value is None or pd.isna(value):
+            return None
+        return float(value)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _fallback_key_levels(candidate_payload: dict[str, Any]) -> dict[str, str]:
+    tech = candidate_payload.get("technical_summary", {}) if isinstance(candidate_payload, dict) else {}
+    price = _as_float(tech.get("adj_close"))
+    atr = _as_float(tech.get("atr14"))
+    ma25 = _as_float(tech.get("ma25"))
+
+    if price is not None and atr is not None and atr > 0:
+        stop = max(price - (1.2 * atr), 0.0)
+        take = price + (2.0 * atr)
+        return {
+            "entry_idea": f"{price:.2f}円付近。出来高を伴う高値更新でエントリーを検討",
+            "stop_idea": f"{stop:.2f}円（ATR14ベースの目安）",
+            "takeprofit_idea": f"{take:.2f}円（ATR14の約2倍幅を目安）",
+        }
+    if price is not None and ma25 is not None:
+        return {
+            "entry_idea": f"{price:.2f}円付近。MA25({ma25:.2f}円)上を維持できるか確認",
+            "stop_idea": f"MA25({ma25:.2f}円)明確割れで見直し",
+            "takeprofit_idea": "直近高値更新時の分割利確を目安",
+        }
+    if price is not None:
+        return {
+            "entry_idea": f"{price:.2f}円付近で出来高増を確認してエントリー検討",
+            "stop_idea": "直近安値割れで撤退を検討",
+            "takeprofit_idea": "リスクリワード1:2以上を目安に分割利確",
+        }
+    return {
+        "entry_idea": "出来高増を伴う高値更新でエントリー検討",
+        "stop_idea": "直近安値割れで撤退を検討",
+        "takeprofit_idea": "リスクリワード1:2以上を目安に分割利確",
+    }
+
+
+def _normalize_text_list(value: Any, *, default_items: list[str], limit: int = 3) -> list[str]:
+    out: list[str] = []
+    if isinstance(value, list):
+        for item in value:
+            text = str(item or "").strip()
+            if not text or _is_placeholder_text(text):
+                continue
+            out.append(text)
+            if len(out) >= limit:
+                break
+    if out:
+        return out
+    return default_items[:limit]
+
+
+def _build_event_risks_from_candidate(candidate_payload: dict[str, Any]) -> list[str]:
+    events = candidate_payload.get("events", []) if isinstance(candidate_payload, dict) else []
+    if not isinstance(events, list) or not events:
+        return []
+    labels: list[str] = []
+    for ev in events:
+        if not isinstance(ev, dict):
+            continue
+        etype = str(ev.get("event_type") or ev.get("type") or "").strip()
+        if not etype:
+            continue
+        labels.append(etype)
+        if len(labels) >= 2:
+            break
+    return labels
+
+
+def _normalize_single_candidate_result(
+    *,
+    code: str,
+    candidate_payload: dict[str, Any],
+    parsed: dict[str, Any] | None,
+    step2_rank: int,
+    validation_error: str | None,
+) -> dict[str, Any]:
+    fallback_levels = _fallback_key_levels(candidate_payload)
+    thesis_bull = _normalize_text_list(
+        parsed.get("thesis_bull") if isinstance(parsed, dict) else None,
+        default_items=["トレンドと出来高が維持される場合、上昇継続の余地"],
+        limit=2,
+    )
+    thesis_bear = _normalize_text_list(
+        parsed.get("thesis_bear") if isinstance(parsed, dict) else None,
+        default_items=["ボラティリティ拡大時は急反落のリスク"],
+        limit=2,
+    )
+
+    key_levels_raw = parsed.get("key_levels", {}) if isinstance(parsed, dict) else {}
+    if not isinstance(key_levels_raw, dict):
+        key_levels_raw = {}
+    key_levels = {
+        "entry_idea": key_levels_raw.get("entry_idea"),
+        "stop_idea": key_levels_raw.get("stop_idea"),
+        "takeprofit_idea": key_levels_raw.get("takeprofit_idea"),
+    }
+    for k, default_text in fallback_levels.items():
+        if _is_placeholder_text(key_levels.get(k)):
+            key_levels[k] = default_text
+        else:
+            key_levels[k] = str(key_levels[k]).strip()
+
+    event_risks = _normalize_text_list(
+        parsed.get("event_risks") if isinstance(parsed, dict) else None,
+        default_items=_build_event_risks_from_candidate(candidate_payload),
+        limit=3,
+    )
+
+    conf = None
+    if isinstance(parsed, dict):
+        conf = parsed.get("confidence_0_100")
+    try:
+        confidence = int(conf) if conf is not None else None
+    except Exception:  # noqa: BLE001
+        confidence = None
+    if confidence is None:
+        confidence = max(35, 76 - max(0, step2_rank - 1))
+    confidence = min(max(confidence, 0), 100)
+
+    data_gaps = _normalize_text_list(
+        parsed.get("data_gaps") if isinstance(parsed, dict) else None,
+        default_items=[],
+        limit=6,
+    )
+    if isinstance(candidate_payload.get("data_gaps"), list):
+        for gap in candidate_payload.get("data_gaps", []):
+            text = str(gap or "").strip()
+            if text and text not in data_gaps:
+                data_gaps.append(text)
+    if validation_error and "llm_output_invalid_or_missing" not in data_gaps:
+        data_gaps.append("llm_output_invalid_or_missing")
+
+    rule_suggestion = None
+    if isinstance(parsed, dict):
+        rs = parsed.get("rule_suggestion")
+        if rs is not None:
+            text = str(rs).strip()
+            rule_suggestion = text or None
+
+    return {
+        "code": code,
+        "thesis_bull": thesis_bull,
+        "thesis_bear": thesis_bear,
+        "key_levels": key_levels,
+        "event_risks": event_risks,
+        "confidence_0_100": confidence,
+        "data_gaps": data_gaps,
+        "rule_suggestion": rule_suggestion,
+    }
 
 
 class SwingPipeline:
@@ -197,7 +374,7 @@ class SwingPipeline:
         ]
         return pd.DataFrame(records)
 
-    def run(self, run_type: str, report_date: date) -> dict[str, Any]:
+    def run(self, run_type: str, report_date: date, *, run_post_hooks: bool = True) -> dict[str, Any]:
         self.logger.info("Pipeline start run_type=%s report_date=%s", run_type, report_date)
         app_cfg = self.settings.app_config
         calendar_rows = self._fetch_calendar(report_date - timedelta(days=240), report_date + timedelta(days=14))
@@ -225,15 +402,21 @@ class SwingPipeline:
             _ = self._wait_for_close_update(trade_date)
 
         result = self._execute(report_date=report_date, trade_date=trade_date, run_type=run_type, calendar_rows=calendar_rows)
-        if result.get("status") == "ok" and run_type in {"morning", "close"} and business_today:
-            try:
-                self.fund_intel_orchestrator.run(session_name=run_type, business_date=report_date)
-            except Exception as exc:  # noqa: BLE001
-                self.logger.error("Fund/Intel hook failed and skipped: %s", exc)
-        elif result.get("status") == "ok" and run_type in {"morning", "close"} and not business_today:
-            self.logger.info("TECH succeeded on non-business day. skip Fund/Intel hook.")
-        elif result.get("status") != "ok":
-            self.logger.error("TECH run failed. skipping Fund/Intel hook. run_type=%s status=%s", run_type, result.get("status"))
+        if run_post_hooks:
+            if result.get("status") == "ok" and run_type in {"morning", "close"} and business_today:
+                try:
+                    self.fund_intel_orchestrator.run(session_name=run_type, business_date=report_date)
+                except Exception as exc:  # noqa: BLE001
+                    self.logger.error("Fund/Intel hook failed and skipped: %s", exc)
+            elif result.get("status") == "ok" and run_type in {"morning", "close"} and not business_today:
+                self.logger.info("TECH succeeded on non-business day. skip Fund/Intel hook.")
+            elif result.get("status") != "ok":
+                self.logger.error("TECH run failed. skipping Fund/Intel hook. run_type=%s status=%s", run_type, result.get("status"))
+        else:
+            if result.get("status") == "ok" and run_type in {"morning", "close"}:
+                self.logger.info("TECH post hook skipped by caller. run_type=%s report_date=%s", run_type, report_date)
+            elif result.get("status") != "ok":
+                self.logger.error("TECH run failed. run_type=%s status=%s", run_type, result.get("status"))
         self.logger.info("Pipeline end run_type=%s report_date=%s status=%s", run_type, report_date, result.get("status"))
         return result
 
@@ -318,7 +501,7 @@ class SwingPipeline:
             day_ok = True
             self.logger.info("Backfill day %s/%s date=%s mode=%s", i, len(target_days), d, mode)
             for rt in run_types:
-                result = self.run(rt, d)
+                result = self.run(rt, d, run_post_hooks=False)
                 status = str(result.get("status"))
                 row["runs"][rt] = status
                 if status != "ok":
@@ -415,7 +598,7 @@ class SwingPipeline:
         for d in targets:
             row: dict[str, Any] = {"date": d.isoformat(), "runs": {}}
             for rt in run_types:
-                result = self.run(rt, d)
+                result = self.run(rt, d, run_post_hooks=False)
                 row["runs"][rt] = str(result.get("status"))
             repaired.append(row)
         return {
@@ -593,44 +776,104 @@ class SwingPipeline:
         shortlist_df = pd.DataFrame()
         llm_valid = False
         llm_error = ""
-        llm_payload_for_db: dict[str, Any] = {}
-        llm_messages = build_top10_messages(
-            report_date=report_date,
-            run_type=run_type,
-            candidates_payload=candidates_payload,
-            rules_payload=rules,
-        )
-
+        llm_messages: list[dict[str, Any]] = []
         llm_raw_response: dict[str, Any] = {}
-        try:
-            llm_raw_response = self.llm.chat_completion(llm_messages)
-            llm_content = _safe_get_latest_content(llm_raw_response)
-            llm_model, llm_error, llm_payload = validate_llm_output(llm_content)
-            llm_payload_for_db = llm_payload if llm_payload is not None else {"content": llm_content}
-            if llm_model:
-                llm_valid = True
-                for item in llm_model.top10:
-                    llm_map[item.code] = item.model_dump()
-        except Exception as exc:  # noqa: BLE001
-            self.logger.exception("LLM processing failed")
-            llm_error = str(exc)
+        llm_payload_for_db: dict[str, Any] = {
+            "mode": "per_symbol",
+            "results": [],
+        }
+        step2_rank_map = {str(r["code"]): int(r["rank"]) for r in top30_df.to_dict("records")}
+        for candidate in candidates_payload:
+            code = str(candidate.get("code") or "")
+            step2_rank = step2_rank_map.get(code, 9999)
+            messages = build_single_candidate_messages(
+                report_date=report_date,
+                run_type=run_type,
+                candidate_payload=candidate,
+                rules_payload=rules,
+            )
+            llm_messages.append({"code": code, "stage": "main", "messages": messages})
+            parsed: dict[str, Any] | None = None
+            validation_error: str | None = None
+            payload_for_log: dict[str, Any] | None = None
+            last_content = ""
+            try:
+                raw = self.llm.chat_completion(messages)
+                llm_raw_response = raw
+                last_content = _safe_get_latest_content(raw)
+                parsed, validation_error, payload_for_log = validate_single_candidate_output(last_content)
+                if parsed is None:
+                    repair_messages = build_single_candidate_repair_messages(
+                        report_date=report_date,
+                        run_type=run_type,
+                        candidate_payload=candidate,
+                        rules_payload=rules,
+                        previous_output=last_content[:8000],
+                        validation_error=validation_error or "unknown_validation_error",
+                    )
+                    llm_messages.append({"code": code, "stage": "repair", "messages": repair_messages})
+                    repair_raw = self.llm.chat_completion(repair_messages)
+                    llm_raw_response = repair_raw
+                    repair_content = _safe_get_latest_content(repair_raw)
+                    parsed2, validation_error2, payload_for_log2 = validate_single_candidate_output(repair_content)
+                    if parsed2 is not None:
+                        parsed = parsed2
+                        validation_error = None
+                        payload_for_log = payload_for_log2
+                    else:
+                        validation_error = validation_error2 or validation_error
+                        payload_for_log = payload_for_log2 if payload_for_log2 is not None else payload_for_log
+            except Exception as exc:  # noqa: BLE001
+                self.logger.exception("LLM processing failed for code=%s", code)
+                validation_error = str(exc)
+
+            normalized = _normalize_single_candidate_result(
+                code=code,
+                candidate_payload=candidate,
+                parsed=parsed,
+                step2_rank=step2_rank,
+                validation_error=validation_error,
+            )
+            llm_map[code] = normalized
+
+            row: dict[str, Any] = {
+                "code": code,
+                "validation_ok": parsed is not None,
+                "validation_error": validation_error,
+                "payload": payload_for_log if payload_for_log is not None else ({"content": last_content} if last_content else None),
+            }
+            llm_payload_for_db["results"].append(row)
+            if parsed is None:
+                self.logger.warning("LLM validation fallback used for code=%s err=%s", code, validation_error)
+
+        llm_valid = bool(llm_map)
+        if not llm_valid:
+            llm_error = "no_per_symbol_candidates"
 
         if llm_valid:
             rows = []
             for code, info in llm_map.items():
-                if code not in set(top30_df["code"].astype(str)):
+                if code not in step2_rank_map:
                     continue
-                rows.append({"code": code, "rank": info["top10_rank"], "reason_json": info})
+                conf = int(info.get("confidence_0_100", 0) or 0)
+                rows.append(
+                    {
+                        "code": code,
+                        "confidence_0_100": conf,
+                        "step2_rank": step2_rank_map.get(code, 9999),
+                        "reason_json": info,
+                    }
+                )
             shortlist_df = pd.DataFrame(rows)
             shortlist_df = (
-                shortlist_df.sort_values(["rank", "code"])
-                .drop_duplicates(subset=["rank"], keep="first")
+                shortlist_df.sort_values(["confidence_0_100", "step2_rank", "code"], ascending=[False, True, True])
                 .drop_duplicates(subset=["code"], keep="first")
                 .head(top10_n)
                 .copy()
             )
             if not shortlist_df.empty:
                 shortlist_df["rank"] = list(range(1, len(shortlist_df) + 1))
+                shortlist_df = shortlist_df[["code", "rank", "reason_json"]]
         if shortlist_df.empty:
             self.logger.warning("LLM invalid or empty. fallback to step2 top scores.")
             shortlist_df = top30_df.sort_values("rank").head(top10_n)[["code", "rank"]].copy()

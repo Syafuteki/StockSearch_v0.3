@@ -1,299 +1,321 @@
-# jp-stock-swing-agent (MVP)
+﻿# jp-stock-swing-agent (MVP)
 
-日本株（東証）の日足データを使って、毎営業日 `08:00` / `15:30` にスクリーニングし、Top10候補をDiscordへ通知する通知専用エージェントです。  
-自動発注はしません。ローカルLLM（LM StudioのOpenAI互換API）でTop30→Top10の文章化と改善提案を行います。
+日本株（東証）の日足データを使って、TECH / FUND / INTEL を実行し、Discordへ通知するシステムです。  
+自動発注は行わず、通知のみを行います。
 
 ## 1. 構成
 
 ```text
 app/src/jpswing/
-  main.py                 # スケジューラ起動
-  pipeline.py             # TECH Step0-3の実行本体
-  fund_intel_orchestrator.py # TECH完了フックでFUND/Intel実行
-  config.py               # yaml + env 読み込み
-  db/                     # SQLAlchemy models/session
-  ingest/                 # J-Quants / FX 取得
-  fund/                   # FUND一次スクリーニング / 状態更新
-  intel/                  # Intel検索 / priority / JSON schema
-  theme/                  # 週次探索 / 日次ThemeStrength
-  rag/                    # kb indexer / retrieve API
-  features/               # テクニカル指標
-  screening/              # Step1/Step2
-  enrich/                 # イベント/地合い/SQ
-  llm/                    # TECH用LM Studio client + schema検証
-  notify/                 # Discord通知整形/送信
+  main.py                     # エントリーポイント（scheduler / one-shot）
+  pipeline.py                 # TECH実行本体
+  fund_intel_orchestrator.py  # FUND / INTEL / THEME 実行
+  config.py                   # YAML + .env 読み込み
+  db/                         # SQLAlchemy models / session
+  ingest/                     # J-Quants / EDINET / FX 取得
+  features/                   # テクニカル指標
+  screening/                  # Step1 / Step2
+  fund/                       # FUND状態更新
+  intel/                      # Intel検索 / 優先度 / LLM schema
+  theme/                      # Theme探索 / 強度更新
+  rag/                        # kb index / retrieval
+  notify/                     # Discord Router
 app/tests/
 config/
   app.yaml
   rules.yaml
   tag_policy.yaml
+  fund.yaml
+  intel.yaml
+  theme.yaml
+  notify.yaml
 ```
 
-## 2. 必要環境
+## 2. 前提
 
 - Windows 11
 - Docker Desktop + Docker Compose
-- LM Studio（`gpt-oss-20b` 等をロードしてAPI有効化）
-- J-Quants APIキー（Standard想定）
+- LM Studio（OpenAI互換API有効）
+- J-Quants APIキー
+- EDINET APIキー
 
 ## 3. セットアップ
 
 1. `.env.example` を `.env` にコピー
-2. `.env` の機密値を設定（特に `JQUANTS_API_KEY`, `EDINET_API_KEY`, `DISCORD_WEBHOOK_URL`）
-3. 必要に応じて `config/*.yaml` を編集
-4. 起動
+2. `.env` を設定
+3. 起動
 
 ```powershell
 Copy-Item .env.example .env
-docker compose up --build
+docker compose up -d --build
 ```
 
-追加設定ファイル:
-
-- `config/fund.yaml`
-- `config/intel.yaml`
-- `config/theme.yaml`
-
-## 4. セキュリティ方針（今回のMVP）
-
-- `.env` はGit管理対象外（`.gitignore`）
-- DB認証情報は `.env` 必須（`docker-compose.yml` で必須化）
-- Postgresの `5432` はデフォルト非公開
-- appコンテナは非rootユーザーで実行
-- GitHub Actionsで `pip-audit` を定期実行（`.github/workflows/security.yml`）
-
-DBポートをローカルから直接使いたい場合のみ、追加Composeファイルを重ねて起動します。
+ログ確認:
 
 ```powershell
-docker compose -f docker-compose.yml -f docker-compose.db-local.yml up --build
+docker compose logs -f app
 ```
 
-## 5. 単発実行
+コンテナ状態:
 
 ```powershell
-# 朝レポート相当
-docker compose run --rm app python -m jpswing.main --once --run-type morning
-
-# 引け後レポート相当
-docker compose run --rm app python -m jpswing.main --once --run-type close
-
-# FUND/Theme/RAG系の個別実行
-docker compose run --rm app python -m jpswing.main --once --run-type fund_weekly
-docker compose run --rm app python -m jpswing.main --once --run-type fund_daily
-docker compose run --rm app python -m jpswing.main --once --run-type theme_weekly
-docker compose run --rm app python -m jpswing.main --once --run-type theme_daily
-docker compose run --rm app python -m jpswing.main --once --run-type rag_index
+docker compose ps
 ```
 
-日付指定:
+## 4. 主要環境変数
+
+必須（主要）:
+
+- `POSTGRES_USER`
+- `POSTGRES_PASSWORD`
+- `POSTGRES_DB`
+- `DATABASE_URL`
+- `JQUANTS_API_KEY`
+- `EDINET_API_KEY`
+- `LMSTUDIO_BASE_URL`
+- `LLM_MODEL_NAME`
+
+Discord通知:
+
+- `DISCORD_WEBHOOK_TECH`
+- `DISCORD_WEBHOOK_FUND_INTEL`
+- `DISCORD_WEBHOOK_FUND_INTEL_FLASH`
+- `DISCORD_WEBHOOK_FUND_INTEL_DETAIL`
+- `DISCORD_WEBHOOK_PROPOSALS`
+
+MCP関連（Intel）:
+
+- `INTEL_USE_MCP=true|false`
+- `INTEL_MCP_PLUGIN_IDS`（例: `mcp/playwright`）
+- `INTEL_MCP_SERVER`
+- `INTEL_MCP_ENDPOINT`
+
+補足:
+
+- `DISCORD_WEBHOOK_TECH` が空の場合、`DISCORD_WEBHOOK_URL` をTECH用の後方互換として利用します。
+- `.env` は機密情報を含むため、Gitへコミットしないでください。
+
+## 5. Discord通知ルーティング
+
+- `Topic.TECH` -> `DISCORD_WEBHOOK_TECH`
+- `Topic.FUND_INTEL_FLASH` -> `DISCORD_WEBHOOK_FUND_INTEL_FLASH`
+- `Topic.FUND_INTEL_DETAIL` -> `DISCORD_WEBHOOK_FUND_INTEL_DETAIL`
+- `Topic.PROPOSALS` -> `DISCORD_WEBHOOK_PROPOSALS`
+
+フォールバック:
+
+- `DISCORD_WEBHOOK_FUND_INTEL_FLASH` 未設定時は `DISCORD_WEBHOOK_FUND_INTEL` を使用
+- `DISCORD_WEBHOOK_FUND_INTEL_DETAIL` 未設定時は `DISCORD_WEBHOOK_FUND_INTEL` を使用
+
+thread利用:
+
+- `config/notify.yaml` の `discord.threads.*` を設定
+- Routerは `?thread_id=<id>&wait=true` で送信
+
+## 6. スケジュール（既定）
+
+TECH:
+
+- morning: `0 8 * * 1-5`
+- close: `30 15 * * 1-5`
+
+FUND / THEME:
+
+- fund_weekly: `0 7 * * 1`
+- fund_daily: `10 7 * * 1-5`
+- theme_weekly: `20 7 * * 1`
+- theme_daily: `40 7 * * 1-5`
+
+INTEL:
+
+- background: `*/20 * * * *`（`config/intel.yaml` の `schedule.enabled=true`）
+- recovery: `15 * * * 1-5`（`config/intel.yaml` の `recovery.enabled=true`）
+
+起動時の自動回復:
+
+- app起動後は `TECH -> FUND` の順でキャッチアップ（欠損営業日を段階的に回復）
+- 回復中は `INTEL background` を自動スキップ（先にTECH/FUNDを埋める）
+- キャッチアップは `startup_catchup.cron` ごとに進み、`max_days_per_run` 件ずつ埋める
+- TECH/FUNDの定時実行が近い時間帯は自動で一時停止し、定時処理後に再開
+
+## 6.1 実行中ジョブ確認（TECH / FUND / INTEL）
+
+直近ログで処理種別を確認:
+
+```powershell
+docker compose logs --since 30m app | Select-String -Pattern "Pipeline start run_type=|Scheduled aux job start type=|Scheduled intel background start|Scheduled auto recover start"
+```
+
+TECHだけ確認:
+
+```powershell
+docker compose logs --since 30m app | Select-String -Pattern "Pipeline start run_type=morning|Pipeline start run_type=close|Pipeline end run_type=morning|Pipeline end run_type=close"
+```
+
+FUND/THEMEだけ確認:
+
+```powershell
+docker compose logs --since 30m app | Select-String -Pattern "Scheduled aux job start type=fund_|Scheduled aux job start type=theme_|One-shot result run_type=fund_|One-shot result run_type=theme_"
+```
+
+INTELだけ確認:
+
+```powershell
+docker compose logs --since 30m app | Select-String -Pattern "Scheduled intel background start|Scheduled intel background end|run_type=intel_background|fund_intel|Intel deep-dive paused|Intel queue item failed"
+```
+
+リアルタイム監視:
+
+```powershell
+docker compose logs -f app
+```
+
+Intelキュー件数（pending/done/failed）を確認:
+
+```powershell
+@'
+from sqlalchemy import create_engine, text
+import os
+
+e = create_engine(os.environ["DATABASE_URL"])
+with e.connect() as c:
+    rows = c.execute(text("select status, count(*) as cnt from intel_queue group by status order by status")).fetchall()
+    for r in rows:
+        print(f"{r.status}\t{r.cnt}")
+'@ | docker compose run --rm -T app python -
+```
+
+## 7. one-shot実行コマンド
+
+TECH:
 
 ```powershell
 docker compose run --rm app python -m jpswing.main --once --run-type morning --date 2026-02-13
+docker compose run --rm app python -m jpswing.main --once --run-type close --date 2026-02-13
 ```
 
-## 6. スケジュール仕様
+FUND / THEME:
 
-- `08:00 JST`: 前営業日終値ベースで通知
-- `15:30 JST`: ジョブ開始。`/v2/equities/bars/daily` 更新をポーリングしてから処理
-- 営業日判定は `/v2/markets/calendar`
-- 休場時は `config/app.yaml` の `send_holiday_notice` に従って通知有無を切替
-- TECH `morning/close` 成功後、FUND+Intel deep-diveをフック実行
-  - morning cap=4
-  - close cap=6
-  - daily hard limit=10
+```powershell
+docker compose run --rm app python -m jpswing.main --once --run-type fund_weekly --date 2026-02-13
+docker compose run --rm app python -m jpswing.main --once --run-type fund_daily --date 2026-02-13
+docker compose run --rm app python -m jpswing.main --once --run-type fund_backfill --date 2026-02-13
+docker compose run --rm app python -m jpswing.main --once --run-type fund_auto_recover --date 2026-02-16
+docker compose run --rm app python -m jpswing.main --once --run-type theme_weekly --date 2026-02-13
+docker compose run --rm app python -m jpswing.main --once --run-type theme_daily --date 2026-02-13
+```
 
-## 7. スクリーニング手順
+INTEL / 復旧:
 
-1. `Step0`: 営業日判定
-2. `Step1`: ユニバース絞り込み（株価・出来高・売買代金・時価総額）
-3. `Step2`: テクニカルスコアでTop30を機械決定
-4. `Step3`: イベント/地合いを付与しLLMでTop10化
-5. LLM JSONが壊れている場合はStep2上位10へフォールバック
+```powershell
+docker compose run --rm app python -m jpswing.main --once --run-type intel_background --date 2026-02-16
+docker compose run --rm app python -m jpswing.main --once --run-type auto_recover --date 2026-02-16
+docker compose run --rm app python -m jpswing.main --once --run-type recover_range --from-date 2026-02-10 --to-date 2026-02-14 --recover-mode close_only
+```
 
-## 8. FUND / Intel / Theme
+RAG:
 
-- FUND:
-  - 週次一次スクリーニングで `IN/WATCH/OUT` 更新
-  - 日次は金融データ更新 or Intelリスク反映時のみ差分更新
-- Intel:
-  - 候補プール A+B（FUND state + EDINET更新 + Theme強い/上昇）
-  - deterministic priority で deep-dive 対象選定
-- EDINET + whitelist IR + optional MCP でソース取得
-  - MCPは `INTEL_MCP_ENDPOINT` 設定時のみ有効（未設定は自動スキップ）
-  - LLM strict JSON schema検証（invalid時フォールバック）
-- Theme:
-  - 週次でseedテーマ再構築と symbol map 更新
-  - 日次で ThemeStrength 更新
+```powershell
+docker compose run --rm app python -m jpswing.main --once --run-type rag_index
+```
 
-Discord通知条件:
-- 重大リスク☠️
-- high-signal tags
-- FUND state変更
-- proposal存在時
+## 8. 実行ロジック概要
 
-## 9. RAG
+TECH:
 
-- `kb/*.md` を front-matter付きで index
-- chunk + embedding を `kb_documents / kb_chunks` に保存
-- `books_fulltext` は index 可能だが、LLM向け retrieval では除外
-- retrieve API: `jpswing.rag.api.RagService.retrieve(query, filters, top_k)`
+- Step0: 営業日判定
+- Step1: Universeフィルタ
+- Step2: テクニカルスコアでTop30
+- Step3: Top30の各銘柄を「1銘柄1LLM呼び出し」で評価し、`confidence_0_100` 優先でTop10化（同点はStep2順位）
+- 検証失敗時は同銘柄に対して再プロンプトでJSON修復を1回実施
+- それでも失敗した銘柄は入力データから決定論フォールバックを生成して継続
+- 最終候補はStep3評価対象（LLM/決定論フォールバック済み）の範囲で確定し、Step2追加補完はしない
 
-## 10. ルール成長設計
+FUND:
 
-- `config/rules.yaml` にルール本体を保持
-- `rule_versions` にバージョン保存
-- LLM提案は `rule_suggestions` に保存のみ（自動適用しない）
-- 人間が採用時に `rules.yaml` を更新して再起動
+- 財務サマリからスコア計算
+- `IN / WATCH / OUT` 更新
+- carry-forward により未開示日でも状態維持可能
 
-## 11. テスト
+INTEL:
+
+- 候補プール A+B（FUND状態 + EDINET更新 + Theme）
+- 優先度順に deep-dive
+- EDINET / whitelist IR / MCP（設定時）を情報源に要約
+- 結果を `intel_items` 等に保存
+
+速報通知条件（FUND_INTEL_FLASH）:
+
+- `critical_risk=true`
+- 高シグナルタグの新規付与
+- FUND状態変化
+
+深掘り通知（FUND_INTEL_DETAIL）:
+
+- 深掘り1件ごとに送信
+
+## 9. LM Studio / MCP
+
+- Intelは `INTEL_USE_MCP=true` かつ `INTEL_MCP_PLUGIN_IDS` 設定時、MCP経路を優先
+- MCP失敗時は `/v1/chat/completions` へフォールバック
+- LM Studio側でMCPを有効でも、アプリ側設定が空ならMCPは使いません
+
+## 10. データ保存方針
+
+- TECH日次テーブルは同一日を置換（再実行で更新）
+- `intel_items` は追記型（履歴が増える）
+- `intel_queue` / `intel_daily_budget` で重複実行を抑制
+
+## 10.1 自動回復の設定
+
+`config/intel.yaml` の `recovery`:
+
+- `enabled`: TECH回復ジョブの有効化
+- `run_on_startup`: app起動時にTECH回復を1回実行
+- `lookback_business_days`: 欠損検出範囲
+- `max_days_per_run`: 1回で埋める最大営業日数
+
+`config/intel.yaml` の `startup_catchup`:
+
+- `enabled`: 起動後キャッチアップゲートの有効化
+- `cron`: 起動後キャッチアップの実行間隔
+- `pause_lead_minutes`: TECH/FUND定時実行の何分前から一時停止するか
+
+`config/fund.yaml` の `recovery`:
+
+- `enabled`: FUND回復の有効化
+- `run_on_startup`: app起動時にFUND回復を1回実行
+- `lookback_business_days`: 欠損検出範囲
+- `max_days_per_run`: 1回で埋める最大営業日数
+- `run_on_holiday`: 休場日実行可否
+- `force`: FUND計算を強制するか（通常は `false` 推奨）
+
+## 11. トラブルシュート
+
+- `no configuration file provided: not found`
+  - `docker-compose.yml` のあるディレクトリで実行してください。
+- J-Quants `403 Forbidden`
+  - プラン外APIまたは権限不足です。該当データは未取得として継続します。
+- EDINET `302 Redirect`
+  - クライアントは候補ベースURLを順次試行します。キーや接続も確認してください。
+- LM Studio `400 Bad Request`
+  - モデル名/APIキー/MCP plugin起動状態を確認してください。
+- `VECTOR(...)` 関連エラー
+  - pgvector拡張不足の可能性。以下を実施:
+
+```powershell
+docker compose exec postgres psql -U $env:POSTGRES_USER -d $env:POSTGRES_DB -c "CREATE EXTENSION IF NOT EXISTS vector;"
+```
+
+## 12. テスト
 
 ```powershell
 python -m pytest -q
 ```
 
-## 10. 脆弱性チェック（ローカル）
+## 13. セキュリティ運用
 
-```powershell
-python -m pip install pip-audit
-python -m pip_audit --strict
-```
-
-## 11. Alembic
-
-初期状態では `create_all` でMVP起動します。  
-運用でマイグレーション管理を行う場合:
-
-```powershell
-docker compose run --rm app alembic -c app/alembic.ini upgrade head
-```
-
-## 12. 例外時の動作
-
-- API欠損/未契約: 該当機能をスキップしてログ記録
-- 株価更新遅延: ポーリングで待機、タイムアウト後は取得済みデータで継続
-- 休場: スキップまたは休場通知
-- LLM不正JSON: フォールバックでTop10確定
-
-## Discord Notification Router (5 Webhooks)
-
-Required env vars (`.env`):
-- `DISCORD_WEBHOOK_TECH` : TECH report channel webhook
-- `DISCORD_WEBHOOK_FUND_INTEL` : FUND Intel legacy/common webhook (fallback)
-- `DISCORD_WEBHOOK_FUND_INTEL_FLASH` : FUND Intel速報 channel webhook
-- `DISCORD_WEBHOOK_FUND_INTEL_DETAIL` : FUND Intel深掘り channel webhook
-- `DISCORD_WEBHOOK_PROPOSALS` : proposals-only channel webhook
-
-Routing:
-- TECH (`Topic.TECH`) -> `DISCORD_WEBHOOK_TECH`
-- FUND Intel速報 (`Topic.FUND_INTEL_FLASH`) -> `DISCORD_WEBHOOK_FUND_INTEL_FLASH`
-- FUND Intel深掘り (`Topic.FUND_INTEL_DETAIL`) -> `DISCORD_WEBHOOK_FUND_INTEL_DETAIL`
-- Proposals (`Topic.PROPOSALS`) -> `DISCORD_WEBHOOK_PROPOSALS`
-
-Fallback behavior:
-- If `DISCORD_WEBHOOK_FUND_INTEL_FLASH` is empty, router falls back to `DISCORD_WEBHOOK_FUND_INTEL`.
-- If `DISCORD_WEBHOOK_FUND_INTEL_DETAIL` is empty, router falls back to `DISCORD_WEBHOOK_FUND_INTEL`.
-
-Optional thread routing:
-- Set `config/notify.yaml` `discord.threads.tech|fund_intel_flash|fund_intel_detail|proposals`
-- Router sends webhook execute URL with `?thread_id=<id>&wait=true`
-
-Behavior:
-- Missing webhook for a topic: warning log + skip (no crash)
-- HTTP 429: respects `Retry-After` then retries
-- 5xx: exponential backoff retry
-- Message limits enforced:
-  - content split at 2000 chars
-  - embeds split to max 10 per message
-- Proposals channel posts only when proposals exist (no no-op messages)
-
-## pgvector Error Recovery
-
-If startup fails around `CREATE TABLE kb_chunks ... embedding VECTOR(1024)`:
-
-1. Recreate DB with the updated pgvector image:
-```powershell
-docker compose down -v
-docker compose up --build
-```
-2. If you must keep volume data, run extension creation manually once:
-```powershell
-docker compose exec postgres psql -U $env:POSTGRES_USER -d $env:POSTGRES_DB -c "CREATE EXTENSION IF NOT EXISTS vector;"
-```
-
-## FUND Bootstrap and Carry-Forward
-
-To initialize FUND for newly built environments, run historical backfill once:
-
-```powershell
-docker compose run --rm app python -m jpswing.main --once --run-type fund_backfill --date 2026-02-13
-```
-
-Behavior:
-- `fund_backfill` scans past business days (`config/fund.yaml` -> `bootstrap.lookback_business_days`) and updates FUND states from `fins/summary`.
-- After backfill, daily refresh carries previous FUND snapshots forward for missing disclosures (`carry_forward.enabled=true`).
-- Carry-forward target states are configurable (`carry_forward.states`, default `IN/WATCH`).
-
-## Intel LM Studio MCP mode
-
-Intel LLM can use LM Studio MCP tools directly (without `INTEL_MCP_ENDPOINT`) when these are set:
-
-- `INTEL_USE_MCP=true`
-- `INTEL_MCP_PLUGIN_IDS=mcp/<plugin_id_1>,mcp/<plugin_id_2>`
-  - Example: `INTEL_MCP_PLUGIN_IDS=mcp/playwright`
-
-Notes:
-
-- This path uses LM Studio `/api/v1/chat` with `integrations`.
-- If MCP call fails, app falls back to OpenAI-compatible `/v1/chat/completions`.
-- If `INTEL_USE_MCP=true` but no plugin IDs are configured, app logs a warning and runs without MCP tool calls.
-
-## Intel Background Scheduler
-
-Intel can run independently from TECH hooks via scheduler.
-
-- Config: `config/intel.yaml` -> `schedule`
-  - `enabled`: enable/disable background Intel job
-  - `cron`: cron expression for periodic Intel runs
-  - `session`: `morning` or `close` (used for Intel queue idempotency key)
-  - `run_on_holiday`: run on non-business day or skip
-  - `use_previous_business_day_on_holiday`: if holiday and enabled, run with previous business date
-
-Manual one-shot command:
-
-```powershell
-docker compose run --rm app python -m jpswing.main --once --run-type intel_background --date 2026-02-16
-```
-
-## Outage Recovery (Date Range Backfill)
-
-When the app was down for multiple days (PC crash, power outage), replay missed business days:
-
-```powershell
-# close report only (recommended for catch-up speed)
-docker compose run --rm app python -m jpswing.main --once --run-type recover_range --from-date 2026-02-10 --to-date 2026-02-14 --recover-mode close_only
-
-# replay both morning and close
-docker compose run --rm app python -m jpswing.main --once --run-type recover_range --from-date 2026-02-10 --to-date 2026-02-14 --recover-mode morning_close
-```
-
-Notes:
-- `recover_range` runs only for business days in the range.
-- `close_only` is faster and usually sufficient for operational catch-up.
-- Results summary includes `ok_days`, `failed_days`, and `failed_details` (up to 20 rows).
-
-### Auto Recover Scheduler
-
-Automatic missed-day recovery is available via `config/intel.yaml` -> `recovery`:
-
-- `enabled`: enable/disable auto recovery job
-- `cron`: when to check for missed business days
-- `lookback_business_days`: window to inspect for gaps
-- `max_days_per_run`: cap replay volume per run
-- `mode`: `close_only` or `morning_close`
-- `run_on_holiday`: allow recovery checks on holidays/weekends
-
-Manual one-shot for the same logic:
-
-```powershell
-docker compose run --rm app python -m jpswing.main --once --run-type auto_recover --date 2026-02-16
-```
+- `.env` をリポジトリに含めない
+- Webhook/APIキーをログや通知文に出さない
+- 取得不可データは「未取得」として扱い、推測で埋めない
+- 通知末尾に免責文を必ず含める
