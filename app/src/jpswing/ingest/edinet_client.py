@@ -23,12 +23,6 @@ class EdinetClient:
             headers["Subscription-Key"] = self.api_key
         return headers
 
-    def _with_subscription_key(self, params: dict[str, Any]) -> dict[str, Any]:
-        out = dict(params)
-        if self.api_key:
-            out["Subscription-Key"] = self.api_key
-        return out
-
     def _candidate_base_urls(self) -> list[str]:
         current = self.base_url.rstrip("/")
         fallbacks = [
@@ -77,7 +71,7 @@ class EdinetClient:
                 endpoint = f"{base_url}/api/v2/documents.json"
                 response = httpx.get(
                     endpoint,
-                    params=self._with_subscription_key(params),
+                    params=params,
                     headers=self._headers(),
                     timeout=self.timeout_sec,
                     follow_redirects=False,
@@ -129,7 +123,7 @@ class EdinetClient:
                 endpoint = f"{base_url}/api/v2/documents/{doc_id}"
                 response = httpx.get(
                     endpoint,
-                    params=self._with_subscription_key(params),
+                    params=params,
                     headers=self._headers(),
                     timeout=self.timeout_sec,
                     follow_redirects=False,

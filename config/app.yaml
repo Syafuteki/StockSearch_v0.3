@@ -33,8 +33,8 @@ external_fx:
   alpha_vantage_base_url: "https://www.alphavantage.co/query"
 
 scheduler:
-  morning_cron: "0 8 * * 1-5"
-  close_cron: "30 15 * * 1-5"
+  morning_cron: ""
+  close_cron: "0 17 * * 1-5"
   timezone: "Asia/Tokyo"
 
 market:

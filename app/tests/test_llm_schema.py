@@ -117,3 +117,26 @@ def test_validate_single_candidate_output_accepts_legacy_top10_wrapper() -> None
     assert model is not None
     assert payload is not None
     assert model["confidence_0_100"] == 70
+
+
+def test_validate_single_candidate_output_normalizes_placeholder_rule_suggestion() -> None:
+    content = """
+    {
+      "thesis_bull": ["trend"],
+      "thesis_bear": ["risk"],
+      "key_levels": {
+        "entry_idea": "breakout",
+        "stop_idea": "recent low",
+        "takeprofit_idea": "2R"
+      },
+      "event_risks": [],
+      "confidence_0_100": 50,
+      "data_gaps": [],
+      "rule_suggestion": "\\u306a\\u3057"
+    }
+    """
+    model, err, payload = validate_single_candidate_output(content)
+    assert err is None
+    assert model is not None
+    assert payload is not None
+    assert model["rule_suggestion"] is None

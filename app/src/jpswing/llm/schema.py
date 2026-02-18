@@ -14,6 +14,11 @@ PLACEHOLDER_TEXTS = {
     "tbd",
     "not available",
     "not_applicable",
+    "\u672a\u53d6\u5f97",
+    "\u306a\u3057",
+    "\u7121\u3057",
+    "\u8a72\u5f53\u306a\u3057",
+    "\u63d0\u6848\u306a\u3057",
 }
 
 
@@ -65,7 +70,9 @@ def _normalize_text_optional(value: str | None) -> str | None:
     if value is None:
         return None
     text = str(value).strip()
-    return text or None
+    if not text or _is_placeholder(text):
+        return None
+    return text
 
 
 def _normalize_text_list(value: list[str] | None) -> list[str]:

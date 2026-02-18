@@ -78,6 +78,7 @@ docker compose ps
 Discord通知:
 
 - `DISCORD_WEBHOOK_TECH`
+- `DISCORD_WEBHOOK_THEME`
 - `DISCORD_WEBHOOK_FUND_INTEL`
 - `DISCORD_WEBHOOK_FUND_INTEL_FLASH`
 - `DISCORD_WEBHOOK_FUND_INTEL_DETAIL`
@@ -98,14 +99,22 @@ MCP関連（Intel）:
 ## 5. Discord通知ルーティング
 
 - `Topic.TECH` -> `DISCORD_WEBHOOK_TECH`
+- `Topic.THEME` -> `DISCORD_WEBHOOK_THEME`
 - `Topic.FUND_INTEL_FLASH` -> `DISCORD_WEBHOOK_FUND_INTEL_FLASH`
 - `Topic.FUND_INTEL_DETAIL` -> `DISCORD_WEBHOOK_FUND_INTEL_DETAIL`
 - `Topic.PROPOSALS` -> `DISCORD_WEBHOOK_PROPOSALS`
 
 フォールバック:
 
+- `DISCORD_WEBHOOK_THEME` 未設定時は `DISCORD_WEBHOOK_FUND_INTEL` を使用
 - `DISCORD_WEBHOOK_FUND_INTEL_FLASH` 未設定時は `DISCORD_WEBHOOK_FUND_INTEL` を使用
 - `DISCORD_WEBHOOK_FUND_INTEL_DETAIL` 未設定時は `DISCORD_WEBHOOK_FUND_INTEL` を使用
+
+PROPOSALS通知の対象:
+
+- `rule_suggestions`（TECH提案）
+- `fund_rule_suggestions`
+- `intel_rule_suggestions`
 
 thread利用:
 
@@ -116,15 +125,15 @@ thread利用:
 
 TECH:
 
-- morning: `0 8 * * 1-5`
-- close: `30 15 * * 1-5`
+- morning: `disabled`（`scheduler.morning_cron: ""`）
+- close: `0 17 * * 1-5`
 
 FUND / THEME:
 
 - fund_weekly: `0 7 * * 1`
 - fund_daily: `10 7 * * 1-5`
-- theme_weekly: `20 7 * * 1`
-- theme_daily: `40 7 * * 1-5`
+- theme_weekly: `0 17 * * 0`（日曜 17:00）
+- theme_daily: `0 16 * * 1-5`
 
 INTEL:
 
@@ -133,10 +142,10 @@ INTEL:
 
 起動時の自動回復:
 
-- app起動後は `TECH -> FUND` の順でキャッチアップ（欠損営業日を段階的に回復）
-- 回復中は `INTEL background` を自動スキップ（先にTECH/FUNDを埋める）
-- キャッチアップは `startup_catchup.cron` ごとに進み、`max_days_per_run` 件ずつ埋める
-- TECH/FUNDの定時実行が近い時間帯は自動で一時停止し、定時処理後に再開
+- app起動後は `TECH -> FUND -> THEME -> INTEL` の順でキャッチアップ（欠損営業日を段階的に回復）
+- 回復中は `INTEL background` を自動スキップ（先にTECH/FUND/THEMEを埋める）
+- キャッチアップは `startup_catchup.cron` ごとに進み、`max_days_per_run` 件ずつ埋める（`0` 以下で全件）
+- TECH/FUND/THEMEの定時実行が近い時間帯は自動で一時停止し、定時処理後に再開
 
 ## 6.1 実行中ジョブ確認（TECH / FUND / INTEL）
 
@@ -203,12 +212,14 @@ docker compose run --rm app python -m jpswing.main --once --run-type fund_backfi
 docker compose run --rm app python -m jpswing.main --once --run-type fund_auto_recover --date 2026-02-16
 docker compose run --rm app python -m jpswing.main --once --run-type theme_weekly --date 2026-02-13
 docker compose run --rm app python -m jpswing.main --once --run-type theme_daily --date 2026-02-13
+docker compose run --rm app python -m jpswing.main --once --run-type theme_auto_recover --date 2026-02-16
 ```
 
 INTEL / 復旧:
 
 ```powershell
 docker compose run --rm app python -m jpswing.main --once --run-type intel_background --date 2026-02-16
+docker compose run --rm app python -m jpswing.main --once --run-type intel_auto_recover --date 2026-02-16
 docker compose run --rm app python -m jpswing.main --once --run-type auto_recover --date 2026-02-16
 docker compose run --rm app python -m jpswing.main --once --run-type recover_range --from-date 2026-02-10 --to-date 2026-02-14 --recover-mode close_only
 ```
@@ -236,6 +247,12 @@ FUND:
 - 財務サマリからスコア計算
 - `IN / WATCH / OUT` 更新
 - carry-forward により未開示日でも状態維持可能
+
+THEME:
+
+- 週次でテーマ定義/銘柄マップ更新
+- 日次でThemeStrength更新
+- 実行ごとにDiscordへサマリー通知（`Topic.FUND_INTEL`）
 
 INTEL:
 
@@ -270,10 +287,17 @@ INTEL:
 
 `config/intel.yaml` の `recovery`:
 
-- `enabled`: TECH回復ジョブの有効化
-- `run_on_startup`: app起動時にTECH回復を1回実行
+- `enabled`: 回復ジョブの有効化
+- `run_on_startup`: app起動時に回復キャッチアップを有効化
 - `lookback_business_days`: 欠損検出範囲
-- `max_days_per_run`: 1回で埋める最大営業日数
+- `max_days_per_run`: 1回で埋める最大営業日数（`0` 以下で上限なし）
+- 定時/手動の `auto_recover` 実行時は `TECH -> FUND -> THEME -> INTEL` の順で復旧
+- 復旧完了判定は「1件でも done なら完了」ではありません。`repaired_days` は実成功日ベースで計算され、未達日は次回も継続して再実行されます。
+- INTELは `intel_queue`（pending/failed有無）と `intel_daily_budget` を突き合わせて完了判定します。
+
+`config/intel.yaml` の `budget`:
+
+- `daily_budget` / `morning_cap` / `close_cap`: INTEL深掘り上限（いずれか `0` 以下で上限なし）
 
 `config/intel.yaml` の `startup_catchup`:
 
@@ -286,9 +310,18 @@ INTEL:
 - `enabled`: FUND回復の有効化
 - `run_on_startup`: app起動時にFUND回復を1回実行
 - `lookback_business_days`: 欠損検出範囲
-- `max_days_per_run`: 1回で埋める最大営業日数
+- `max_days_per_run`: 1回で埋める最大営業日数（`0` 以下で上限なし）
 - `run_on_holiday`: 休場日実行可否
 - `force`: FUND計算を強制するか（通常は `false` 推奨）
+
+`config/theme.yaml` の `recovery`:
+
+- `enabled`: THEME回復の有効化
+- `run_on_startup`: app起動時にTHEME回復を実行
+- `lookback_business_days`: 欠損検出範囲
+- `max_days_per_run`: 1回で埋める最大営業日数（`0` 以下で上限なし）
+- `run_on_holiday`: 休場日実行可否
+- `refresh_mapping`: 回復前にテーマ紐づけを再計算するか
 
 ## 11. トラブルシュート
 

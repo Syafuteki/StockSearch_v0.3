@@ -15,6 +15,7 @@ DEFAULT_MAX_EMBED_TEXT_PER_MESSAGE = 6000
 
 class Topic(str, Enum):
     TECH = "tech"
+    THEME = "theme"
     FUND_INTEL = "fund_intel"
     FUND_INTEL_FLASH = "fund_intel_flash"
     FUND_INTEL_DETAIL = "fund_intel_detail"
@@ -208,9 +209,12 @@ class DiscordRouter:
     def from_config(cls, discord_cfg: Any, timeout_sec: int = 15) -> "DiscordRouter":
         fund_intel_webhook = getattr(getattr(discord_cfg, "webhooks", object()), "fund_intel", "")
         fund_intel_thread = getattr(getattr(discord_cfg, "threads", object()), "fund_intel", None)
+        theme_webhook = getattr(getattr(discord_cfg, "webhooks", object()), "theme", "") or fund_intel_webhook
+        theme_thread = getattr(getattr(discord_cfg, "threads", object()), "theme", None) or fund_intel_thread
         webhooks = {
             Topic.TECH.value: getattr(getattr(discord_cfg, "webhooks", object()), "tech", "")
             or getattr(discord_cfg, "webhook_url", ""),
+            Topic.THEME.value: theme_webhook,
             Topic.FUND_INTEL.value: fund_intel_webhook,
             Topic.FUND_INTEL_FLASH.value: getattr(getattr(discord_cfg, "webhooks", object()), "fund_intel_flash", "")
             or fund_intel_webhook,
@@ -220,6 +224,7 @@ class DiscordRouter:
         }
         threads = {
             Topic.TECH.value: getattr(getattr(discord_cfg, "threads", object()), "tech", None),
+            Topic.THEME.value: theme_thread,
             Topic.FUND_INTEL.value: fund_intel_thread,
             Topic.FUND_INTEL_FLASH.value: getattr(getattr(discord_cfg, "threads", object()), "fund_intel_flash", None)
             or fund_intel_thread,

@@ -26,7 +26,7 @@ class _DummyResponse:
             raise RuntimeError(f"status={self.status_code}")
 
 
-def test_fetch_documents_list_adds_subscription_key_to_query(monkeypatch) -> None:
+def test_fetch_documents_list_sends_subscription_key_in_header_only(monkeypatch) -> None:
     captured: dict[str, object] = {}
 
     def _fake_get(url, *, params=None, headers=None, timeout=None, follow_redirects=None):  # noqa: ANN001
@@ -43,8 +43,10 @@ def test_fetch_documents_list_adds_subscription_key_to_query(monkeypatch) -> Non
 
     assert len(rows) == 1
     assert isinstance(captured.get("params"), dict)
-    assert captured["params"]["Subscription-Key"] == "abc123"  # type: ignore[index]
     assert captured["params"]["date"] == "2026-02-13"  # type: ignore[index]
+    assert captured["params"].get("Subscription-Key") is None  # type: ignore[index]
+    assert isinstance(captured.get("headers"), dict)
+    assert captured["headers"]["Subscription-Key"] == "abc123"  # type: ignore[index]
 
 
 def test_fetch_documents_list_respects_retry_after_on_429(monkeypatch) -> None:

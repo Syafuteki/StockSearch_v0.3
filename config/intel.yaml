@@ -1,7 +1,7 @@
 budget:
-  daily_budget: 10
-  morning_cap: 4
-  close_cap: 6
+  daily_budget: 0
+  morning_cap: 0
+  close_cap: 0
 
 schedule:
   enabled: true
@@ -15,7 +15,7 @@ recovery:
   run_on_startup: true
   cron: "15 * * * 1-5"
   lookback_business_days: 40
-  max_days_per_run: 3
+  max_days_per_run: 0
   mode: "close_only"
   run_on_holiday: true
 

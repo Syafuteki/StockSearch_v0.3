@@ -19,7 +19,7 @@ from jpswing.utils.time import today_jst
 
 _SCHEDULER_MUTEX = threading.Lock()
 _STARTUP_CATCHUP_MUTEX = threading.Lock()
-_STARTUP_CATCHUP_PHASE = "done"  # tech -> fund -> done
+_STARTUP_CATCHUP_PHASE = "done"  # tech -> fund -> theme -> intel -> done
 
 
 def _parse_args() -> argparse.Namespace:
@@ -36,6 +36,8 @@ def _parse_args() -> argparse.Namespace:
             "fund_daily",
             "fund_backfill",
             "fund_auto_recover",
+            "intel_auto_recover",
+            "theme_auto_recover",
             "theme_weekly",
             "theme_daily",
             "intel_background",
@@ -116,11 +118,14 @@ def _should_pause_startup_catchup(pipeline: SwingPipeline, report_date: date) ->
     lead_sec = lead_minutes * 60
 
     fund_cfg = pipeline.settings.fund_config.get("schedule", {})
+    theme_cfg = pipeline.settings.theme_config.get("schedule", {})
     cron_exprs = [
         str(pipeline.settings.app_config.scheduler.morning_cron or "").strip(),
         str(pipeline.settings.app_config.scheduler.close_cron or "").strip(),
         str(fund_cfg.get("weekly_cron", "0 7 * * 1")).strip(),
         str(fund_cfg.get("daily_refresh_cron", "10 7 * * 1-5")).strip(),
+        str(theme_cfg.get("weekly_discovery_cron", "0 17 * * 0")).strip(),
+        str(theme_cfg.get("daily_strength_cron", "0 16 * * 1-5")).strip(),
     ]
     for expr in cron_exprs:
         if not expr:
@@ -188,7 +193,12 @@ def _run_auto_recover_job(pipeline: SwingPipeline) -> None:
         report_date = today_jst()
         log = logging.getLogger(__name__)
         log.info("Scheduled auto recover start date=%s", report_date)
-        result = pipeline.run_auto_recover(report_date)
+        result = {
+            "tech": pipeline.run_auto_recover(report_date),
+            "fund": pipeline.fund_intel_orchestrator.run_fund_auto_recover(report_date=report_date),
+            "theme": pipeline.fund_intel_orchestrator.run_theme_auto_recover(report_date=report_date),
+            "intel": pipeline.fund_intel_orchestrator.run_intel_auto_recover(report_date=report_date),
+        }
         log.info("Scheduled auto recover end result=%s", result)
 
     _run_serialized("auto_recover", _do)
@@ -202,12 +212,15 @@ def _run_startup_catchup_step_job(pipeline: SwingPipeline) -> None:
         if phase == "done":
             return
         if _should_pause_startup_catchup(pipeline, report_date):
-            logger.info("Startup catch-up paused for upcoming TECH/FUND window. phase=%s", phase)
+            logger.info("Startup catch-up paused for upcoming TECH/FUND/THEME window. phase=%s", phase)
             return
 
         while True:
             if _should_pause_startup_catchup(pipeline, report_date):
-                logger.info("Startup catch-up paused for upcoming TECH/FUND window. phase=%s", _get_startup_catchup_phase())
+                logger.info(
+                    "Startup catch-up paused for upcoming TECH/FUND/THEME window. phase=%s",
+                    _get_startup_catchup_phase(),
+                )
                 return
             phase = _get_startup_catchup_phase()
             if phase == "done":
@@ -218,8 +231,13 @@ def _run_startup_catchup_step_job(pipeline: SwingPipeline) -> None:
                 logger.info("Startup catch-up step end phase=tech result=%s", result)
                 if _is_recovery_phase_complete(result):
                     fund_recovery_cfg = pipeline.settings.fund_config.get("recovery", {})
+                    theme_recovery_cfg = pipeline.settings.theme_config.get("recovery", {})
                     if bool(fund_recovery_cfg.get("run_on_startup", True)):
                         _set_startup_catchup_phase("fund")
+                    elif bool(theme_recovery_cfg.get("run_on_startup", True)):
+                        _set_startup_catchup_phase("theme")
+                    elif bool(pipeline.settings.intel_config.get("recovery", {}).get("run_on_startup", True)):
+                        _set_startup_catchup_phase("intel")
                     else:
                         _set_startup_catchup_phase("done")
                     continue
@@ -228,6 +246,31 @@ def _run_startup_catchup_step_job(pipeline: SwingPipeline) -> None:
                 logger.info("Startup catch-up step start phase=fund date=%s", report_date)
                 result = pipeline.fund_intel_orchestrator.run_fund_auto_recover(report_date=report_date)
                 logger.info("Startup catch-up step end phase=fund result=%s", result)
+                if _is_recovery_phase_complete(result):
+                    theme_recovery_cfg = pipeline.settings.theme_config.get("recovery", {})
+                    if bool(theme_recovery_cfg.get("run_on_startup", True)):
+                        _set_startup_catchup_phase("theme")
+                    elif bool(pipeline.settings.intel_config.get("recovery", {}).get("run_on_startup", True)):
+                        _set_startup_catchup_phase("intel")
+                    else:
+                        _set_startup_catchup_phase("done")
+                        logger.info("Startup catch-up completed")
+                return
+            if phase == "theme":
+                logger.info("Startup catch-up step start phase=theme date=%s", report_date)
+                result = pipeline.fund_intel_orchestrator.run_theme_auto_recover(report_date=report_date)
+                logger.info("Startup catch-up step end phase=theme result=%s", result)
+                if _is_recovery_phase_complete(result):
+                    if bool(pipeline.settings.intel_config.get("recovery", {}).get("run_on_startup", True)):
+                        _set_startup_catchup_phase("intel")
+                    else:
+                        _set_startup_catchup_phase("done")
+                        logger.info("Startup catch-up completed")
+                return
+            if phase == "intel":
+                logger.info("Startup catch-up step start phase=intel date=%s", report_date)
+                result = pipeline.fund_intel_orchestrator.run_intel_auto_recover(report_date=report_date)
+                logger.info("Startup catch-up step end phase=intel result=%s", result)
                 if _is_recovery_phase_complete(result):
                     _set_startup_catchup_phase("done")
                     logger.info("Startup catch-up completed")
@@ -245,15 +288,25 @@ def _init_startup_catchup_state(pipeline: SwingPipeline) -> None:
     enabled = bool(cfg.get("enabled", True))
     tech_recovery_cfg = pipeline.settings.intel_config.get("recovery", {})
     fund_recovery_cfg = pipeline.settings.fund_config.get("recovery", {})
+    theme_recovery_cfg = pipeline.settings.theme_config.get("recovery", {})
     tech_on_startup = bool(tech_recovery_cfg.get("run_on_startup", True))
     fund_on_startup = bool(fund_recovery_cfg.get("run_on_startup", True))
-    if enabled and (tech_on_startup or fund_on_startup):
+    theme_on_startup = bool(theme_recovery_cfg.get("run_on_startup", True))
+    intel_on_startup = bool(tech_recovery_cfg.get("run_on_startup", True))
+    if enabled and (tech_on_startup or fund_on_startup or theme_on_startup or intel_on_startup):
         if tech_on_startup:
             _set_startup_catchup_phase("tech")
             logger.info("Startup catch-up initialized phase=tech")
         else:
-            _set_startup_catchup_phase("fund")
-            logger.info("Startup catch-up initialized phase=fund")
+            if fund_on_startup:
+                _set_startup_catchup_phase("fund")
+                logger.info("Startup catch-up initialized phase=fund")
+            elif theme_on_startup:
+                _set_startup_catchup_phase("theme")
+                logger.info("Startup catch-up initialized phase=theme")
+            else:
+                _set_startup_catchup_phase("intel")
+                logger.info("Startup catch-up initialized phase=intel")
     elif enabled:
         _set_startup_catchup_phase("done")
         logger.info("Startup catch-up disabled by run_on_startup flags")
@@ -284,12 +337,21 @@ def main() -> None:
                     result = pipeline.fund_intel_orchestrator.run_fund_backfill(business_date=report_date)
                 elif rt == "fund_auto_recover":
                     result = pipeline.fund_intel_orchestrator.run_fund_auto_recover(report_date=report_date)
+                elif rt == "intel_auto_recover":
+                    result = pipeline.fund_intel_orchestrator.run_intel_auto_recover(report_date=report_date)
+                elif rt == "theme_auto_recover":
+                    result = pipeline.fund_intel_orchestrator.run_theme_auto_recover(report_date=report_date)
                 elif rt == "theme_weekly":
                     result = pipeline.fund_intel_orchestrator.run_theme_weekly(business_date=report_date)
                 elif rt == "intel_background":
                     result = pipeline.run_intel_background(report_date)
                 elif rt == "auto_recover":
-                    result = pipeline.run_auto_recover(report_date)
+                    result = {
+                        "tech": pipeline.run_auto_recover(report_date),
+                        "fund": pipeline.fund_intel_orchestrator.run_fund_auto_recover(report_date=report_date),
+                        "theme": pipeline.fund_intel_orchestrator.run_theme_auto_recover(report_date=report_date),
+                        "intel": pipeline.fund_intel_orchestrator.run_intel_auto_recover(report_date=report_date),
+                    }
                 elif rt == "recover_range":
                     start = _parse_date(args.from_date or args.date)
                     end = _parse_date(args.to_date or args.date)
@@ -328,20 +390,29 @@ def main() -> None:
                 "misfire_grace_time": 300,
             },
         )
-        scheduler.add_job(
-            _run_job,
-            CronTrigger.from_crontab(settings.app_config.scheduler.morning_cron, timezone=tz),
-            args=[pipeline, "morning"],
-            id="morning_job",
-            replace_existing=True,
-        )
-        scheduler.add_job(
-            _run_job,
-            CronTrigger.from_crontab(settings.app_config.scheduler.close_cron, timezone=tz),
-            args=[pipeline, "close"],
-            id="close_job",
-            replace_existing=True,
-        )
+        morning_cron = str(settings.app_config.scheduler.morning_cron or "").strip()
+        if morning_cron:
+            scheduler.add_job(
+                _run_job,
+                CronTrigger.from_crontab(morning_cron, timezone=tz),
+                args=[pipeline, "morning"],
+                id="morning_job",
+                replace_existing=True,
+            )
+        else:
+            logger.info("TECH morning scheduler disabled (empty morning_cron)")
+
+        close_cron = str(settings.app_config.scheduler.close_cron or "").strip()
+        if close_cron:
+            scheduler.add_job(
+                _run_job,
+                CronTrigger.from_crontab(close_cron, timezone=tz),
+                args=[pipeline, "close"],
+                id="close_job",
+                replace_existing=True,
+            )
+        else:
+            logger.info("TECH close scheduler disabled (empty close_cron)")
         fund_cfg = settings.fund_config.get("schedule", {})
         theme_cfg = settings.theme_config.get("schedule", {})
         scheduler.add_job(
@@ -360,14 +431,14 @@ def main() -> None:
         )
         scheduler.add_job(
             _run_aux_job,
-            CronTrigger.from_crontab(str(theme_cfg.get("weekly_discovery_cron", "20 7 * * 1")), timezone=tz),
+            CronTrigger.from_crontab(str(theme_cfg.get("weekly_discovery_cron", "0 17 * * 0")), timezone=tz),
             args=[pipeline, "theme_weekly"],
             id="theme_weekly_job",
             replace_existing=True,
         )
         scheduler.add_job(
             _run_aux_job,
-            CronTrigger.from_crontab(str(theme_cfg.get("daily_strength_cron", "40 7 * * 1-5")), timezone=tz),
+            CronTrigger.from_crontab(str(theme_cfg.get("daily_strength_cron", "0 16 * * 1-5")), timezone=tz),
             args=[pipeline, "theme_daily"],
             id="theme_daily_job",
             replace_existing=True,

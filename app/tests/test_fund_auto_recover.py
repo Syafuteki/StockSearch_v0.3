@@ -106,3 +106,72 @@ def test_fund_auto_recover_repairs_only_missing_days_with_cap(tmp_path: Path) ->
     assert date(2026, 2, 12) in restored_dates
     assert date(2026, 2, 16) in restored_dates
     assert date(2026, 2, 17) not in restored_dates
+
+
+def test_fund_auto_recover_without_cap_repairs_all_missing_days(tmp_path: Path) -> None:
+    settings = load_settings("config")
+    settings.fund_config["states"] = {"in_min": 0.0, "watch_min": -1.0}
+    settings.fund_config["recovery"] = {
+        "enabled": True,
+        "lookback_business_days": 5,
+        "max_days_per_run": 0,
+        "run_on_holiday": True,
+        "force": False,
+        "request_interval_sec": 0.0,
+    }
+
+    db = DBSessionManager(_sqlite_url(tmp_path))
+    db.init_schema()
+    jq = _DummyJQuants(
+        fin_rows_by_date={
+            date(2026, 2, 12): [
+                {
+                    "Code": "11110",
+                    "Sales": 100.0,
+                    "OP": 20.0,
+                    "NP": 10.0,
+                    "FSales": 130.0,
+                    "EPS": 100.0,
+                    "FEPS": 140.0,
+                    "Eq": 100.0,
+                    "TA": 150.0,
+                    "BPS": 200.0,
+                }
+            ]
+        }
+    )
+    orch = FundIntelOrchestrator(
+        settings=settings,
+        db=db,
+        jquants=jq,
+        notifier=_DummyNotifier(),  # type: ignore[arg-type]
+    )
+
+    with db.session_scope() as session:
+        session.add(
+            FundFeaturesSnapshot(
+                code="11110",
+                asof_date=date(2026, 2, 13),
+                features={"fund_score": 0.8, "state": "IN"},
+            )
+        )
+
+    result = orch.run_fund_auto_recover(report_date=date(2026, 2, 18))
+    assert result["status"] == "ok"
+    assert result["missing_days"] >= 2
+    assert result["repaired_days"] == result["missing_days"]
+
+    with db.session_scope() as session:
+        rows = session.execute(
+            select(FundFeaturesSnapshot.asof_date)
+            .where(
+                FundFeaturesSnapshot.asof_date >= date(2026, 2, 12),
+                FundFeaturesSnapshot.asof_date <= date(2026, 2, 18),
+            )
+            .distinct()
+            .order_by(FundFeaturesSnapshot.asof_date.asc())
+        ).all()
+    restored_dates = [r[0] for r in rows]
+    assert date(2026, 2, 12) in restored_dates
+    assert date(2026, 2, 16) in restored_dates
+    assert date(2026, 2, 17) in restored_dates

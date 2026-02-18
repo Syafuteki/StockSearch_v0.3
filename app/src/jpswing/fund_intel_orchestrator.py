@@ -1,12 +1,13 @@
 ﻿from __future__ import annotations
 
 import logging
+import re
 from datetime import date, datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
 
 from apscheduler.triggers.cron import CronTrigger
-from sqlalchemy import select
+from sqlalchemy import select, func
 from sqlalchemy.orm import Session
 
 from jpswing.config import Settings
@@ -20,7 +21,9 @@ from jpswing.db.models import (
     IntelQueue,
     IntelRuleSuggestion,
     Notification,
+    RuleSuggestion,
     FundFeaturesSnapshot,
+    Theme,
     ThemeStrengthDaily,
     ThemeSymbolMap,
 )
@@ -60,6 +63,44 @@ def _display_code(raw_code: str) -> str:
     return code
 
 
+def _edinet_doc_id(doc: dict[str, Any]) -> str | None:
+    for key in ("docID", "doc_id", "docId"):
+        raw = doc.get(key)
+        if raw is None:
+            continue
+        token = "".join(ch for ch in str(raw).upper() if ch.isalnum())
+        if token:
+            return token
+    return None
+
+
+def _edinet_doc_id_from_url(source_url: str) -> str | None:
+    text = str(source_url or "")
+    if not text:
+        return None
+    match = re.search(r"/documents/([A-Za-z0-9]+)", text)
+    if not match:
+        return None
+    token = "".join(ch for ch in match.group(1).upper() if ch.isalnum())
+    return token or None
+
+
+def _seed_doc_ids(seed: Any) -> set[str]:
+    if not isinstance(seed, dict):
+        return set()
+    docs = seed.get("edinet_docs")
+    if not isinstance(docs, list):
+        return set()
+    out: set[str] = set()
+    for row in docs:
+        if not isinstance(row, dict):
+            continue
+        doc_id = _edinet_doc_id(row)
+        if doc_id:
+            out.add(doc_id)
+    return out
+
+
 def _clip_text(value: Any, limit: int = 180) -> str:
     text = str(value or "").strip()
     if len(text) <= limit:
@@ -76,6 +117,10 @@ def _clean_text(value: Any, limit: int = 180) -> str:
     if limit <= 3:
         return text[:limit]
     return f"{text[: limit - 3]}..."
+
+
+FUND_INTEL_DETAIL_HEADLINE_LIMIT = 160
+FUND_INTEL_DETAIL_SUMMARY_LIMIT = 520
 
 
 def _normalize_mcp_integrations(search_cfg: dict[str, Any]) -> list[str | dict[str, Any]]:
@@ -354,7 +399,7 @@ class FundIntelOrchestrator:
             return {"status": "disabled"}
 
         lookback_business_days = max(1, int(cfg.get("lookback_business_days", 40)))
-        max_days_per_run = max(1, int(cfg.get("max_days_per_run", 3)))
+        max_days_per_run = int(cfg.get("max_days_per_run", 3))
         run_on_holiday = bool(cfg.get("run_on_holiday", True))
         force = bool(cfg.get("force", False))
         interval_sec = float(cfg.get("request_interval_sec", 0.0))
@@ -403,7 +448,10 @@ class FundIntelOrchestrator:
                     "checked_days": len(biz_days),
                 }
 
-            targets = missing_dates[:max_days_per_run]
+            if max_days_per_run <= 0:
+                targets = missing_dates
+            else:
+                targets = missing_dates[:max_days_per_run]
             self.logger.info(
                 "Fund auto recover start report_date=%s force=%s targets=%s",
                 report_date,
@@ -411,6 +459,7 @@ class FundIntelOrchestrator:
                 [d.isoformat() for d in targets],
             )
             details: list[dict[str, Any]] = []
+            repaired_days = 0
             for idx, d in enumerate(targets, start=1):
                 changes = self.fund_service.refresh_states(
                     session,
@@ -420,13 +469,24 @@ class FundIntelOrchestrator:
                 )
                 session.flush()
                 changed_count = len([c for c in changes if c.changed])
+                snapshot_count = int(
+                    session.scalar(
+                        select(func.count()).select_from(FundFeaturesSnapshot).where(FundFeaturesSnapshot.asof_date == d)
+                    )
+                    or 0
+                )
+                day_ok = snapshot_count > 0
                 details.append(
                     {
                         "date": d.isoformat(),
                         "rows": len(changes),
                         "changes": changed_count,
+                        "snapshot_rows": snapshot_count,
+                        "recovered": day_ok,
                     }
                 )
+                if day_ok:
+                    repaired_days += 1
                 if idx % 20 == 0 or idx == len(targets):
                     self.logger.info(
                         "Fund auto recover progress: %s/%s day=%s rows=%s changed=%s",
@@ -446,16 +506,220 @@ class FundIntelOrchestrator:
                 "report_date": report_date.isoformat(),
                 "checked_days": len(biz_days),
                 "missing_days": len(missing_dates),
-                "repaired_days": len(targets),
+                "repaired_days": repaired_days,
                 "details": details,
             }
+
+    def run_intel_auto_recover(self, *, report_date: date) -> dict[str, Any]:
+        cfg = self.settings.intel_config.get("recovery", {})
+        if not bool(cfg.get("enabled", False)):
+            return {"status": "disabled"}
+
+        lookback_business_days = max(1, int(cfg.get("lookback_business_days", 40)))
+        max_days_per_run = int(cfg.get("max_days_per_run", 3))
+        mode = str(cfg.get("mode", "close_only")).strip() or "close_only"
+        run_on_holiday = bool(cfg.get("run_on_holiday", True))
+
+        horizon_days = max(lookback_business_days * 4, 120)
+        cal_from = report_date - timedelta(days=horizon_days)
+        calendar_rows = self.jquants.fetch_calendar(cal_from, report_date + timedelta(days=14))
+        business_today = is_business_day(report_date, calendar_rows)
+        if not business_today and not run_on_holiday:
+            return {
+                "status": "holiday_skip",
+                "report_date": report_date.isoformat(),
+                "reason": "run_on_holiday=false",
+            }
+
+        end_date = previous_business_day(report_date, calendar_rows)
+        if end_date >= report_date and business_today:
+            end_date = previous_business_day(end_date, calendar_rows)
+        if end_date is None:
+            return {"status": "no_target"}
+
+        biz_days = business_days_in_range(calendar_rows, end_date - timedelta(days=horizon_days), end_date)
+        if len(biz_days) > lookback_business_days:
+            biz_days = biz_days[-lookback_business_days:]
+        if not biz_days:
+            return {"status": "no_business_days"}
+
+        mode_map = {
+            "close_only": ["close"],
+            "morning_close": ["morning", "close"],
+        }
+        sessions = mode_map.get(mode, ["close"])
+
+        with self.db.session_scope() as session:
+            if not try_advisory_xact_lock(session, f"intel_auto_recover:{report_date}"):
+                return {"status": "locked"}
+            budget_rows = session.execute(
+                select(
+                    IntelDailyBudget.business_date,
+                    IntelDailyBudget.done_count,
+                    IntelDailyBudget.morning_done,
+                    IntelDailyBudget.close_done,
+                ).where(
+                    IntelDailyBudget.business_date >= biz_days[0],
+                    IntelDailyBudget.business_date <= biz_days[-1],
+                )
+            ).all()
+            queue_rows = session.execute(
+                select(
+                    IntelQueue.business_date,
+                    IntelQueue.session,
+                    IntelQueue.status,
+                    func.count(),
+                ).where(
+                    IntelQueue.business_date >= biz_days[0],
+                    IntelQueue.business_date <= biz_days[-1],
+                )
+                .group_by(IntelQueue.business_date, IntelQueue.session, IntelQueue.status)
+            ).all()
+
+            budget_by_date: dict[date, tuple[int, int, int]] = {}
+            for business_date_row, done_count, morning_done, close_done in budget_rows:
+                if business_date_row is None:
+                    continue
+                budget_by_date[business_date_row] = (
+                    int(done_count or 0),
+                    int(morning_done or 0),
+                    int(close_done or 0),
+                )
+
+            queue_stats: dict[date, dict[str, dict[str, int]]] = {}
+            for business_date_row, session_name, status, count in queue_rows:
+                if business_date_row is None:
+                    continue
+                key_session = str(session_name or "")
+                key_status = str(status or "")
+                if not key_session or not key_status:
+                    continue
+                day_bucket = queue_stats.setdefault(business_date_row, {})
+                sess_bucket = day_bucket.setdefault(key_session, {})
+                sess_bucket[key_status] = int(count or 0)
+
+            done_dates: set[date] = set()
+            for d in biz_days:
+                if self._is_intel_recovery_day_complete(
+                    sessions=sessions,
+                    budget=budget_by_date.get(d),
+                    queue_by_session=queue_stats.get(d, {}),
+                ):
+                    done_dates.add(d)
+
+            item_rows = session.execute(
+                select(IntelItem.source_url).where(IntelItem.source_type == "edinet")
+            ).all()
+            processed_doc_ids = {
+                doc_id
+                for (source_url,) in item_rows
+                for doc_id in [_edinet_doc_id_from_url(str(source_url or ""))]
+                if doc_id
+            }
+
+        missing_dates = [d for d in biz_days if d not in done_dates]
+        edinet_gap_days: list[date] = []
+        for d in [x for x in biz_days if x in done_dates]:
+            try:
+                docs = self.edinet.fetch_documents_list(d)
+            except Exception as exc:  # noqa: BLE001
+                self.logger.warning("Intel auto recover EDINET probe failed. date=%s err=%s", d, exc)
+                continue
+            day_doc_ids = {doc_id for row in docs if isinstance(row, dict) for doc_id in [_edinet_doc_id(row)] if doc_id}
+            if not day_doc_ids:
+                continue
+            unresolved = sorted(day_doc_ids - processed_doc_ids)
+            if not unresolved:
+                continue
+            edinet_gap_days.append(d)
+            self.logger.info(
+                "Intel auto recover EDINET gaps found. date=%s unresolved=%s sample=%s",
+                d,
+                len(unresolved),
+                unresolved[:3],
+            )
+        if edinet_gap_days:
+            missing_dates = sorted(set(missing_dates).union(edinet_gap_days))
+
+        if not missing_dates:
+            return {
+                "status": "no_gap",
+                "from": biz_days[0].isoformat(),
+                "to": biz_days[-1].isoformat(),
+                "checked_days": len(biz_days),
+                "edinet_gap_days": [],
+            }
+
+        if max_days_per_run <= 0:
+            targets = missing_dates
+        else:
+            targets = missing_dates[:max_days_per_run]
+        self.logger.info(
+            "Intel auto recover start report_date=%s mode=%s targets=%s",
+            report_date,
+            mode,
+            [d.isoformat() for d in targets],
+        )
+
+        details: list[dict[str, Any]] = []
+        repaired_days = 0
+        for d in targets:
+            row: dict[str, Any] = {"date": d.isoformat(), "runs": {}}
+            day_ok = True
+            for session_name in sessions:
+                result = self.run_intel_only(session_name=session_name, business_date=d)
+                status = str(result.get("status"))
+                row["runs"][session_name] = status
+                if status != "ok":
+                    day_ok = False
+            details.append(row)
+            if day_ok:
+                repaired_days += 1
+
+        return {
+            "status": "ok",
+            "report_date": report_date.isoformat(),
+            "mode": mode,
+            "checked_days": len(biz_days),
+            "missing_days": len(missing_dates),
+            "repaired_days": repaired_days,
+            "attempted_days": len(targets),
+            "edinet_gap_days": [d.isoformat() for d in edinet_gap_days],
+            "details": details,
+        }
 
     def run_theme_weekly(self, *, business_date: date) -> dict[str, Any]:
         with self.db.session_scope() as session:
             if not try_advisory_xact_lock(session, f"theme_weekly:{business_date}"):
                 return {"status": "locked"}
+            theme_before = int(session.scalar(select(func.count()).select_from(Theme)) or 0)
+            map_before = int(session.scalar(select(func.count()).select_from(ThemeSymbolMap)) or 0)
             self.theme_service.weekly_discover(session, business_date, self.jquants)
-            return {"status": "ok"}
+            session.flush()
+            theme_after = int(session.scalar(select(func.count()).select_from(Theme)) or 0)
+            map_after = int(session.scalar(select(func.count()).select_from(ThemeSymbolMap)) or 0)
+            self._send_notifications(
+                session,
+                business_date,
+                [
+                    self._build_theme_weekly_notification(
+                        business_date=business_date,
+                        theme_before=theme_before,
+                        theme_after=theme_after,
+                        map_before=map_before,
+                        map_after=map_after,
+                    )
+                ],
+                topic=Topic.THEME,
+                run_type="theme_weekly",
+            )
+            return {
+                "status": "ok",
+                "theme_before": theme_before,
+                "theme_after": theme_after,
+                "map_before": map_before,
+                "map_after": map_after,
+            }
 
     def run_theme_daily(self, *, business_date: date) -> dict[str, Any]:
         with self.db.session_scope() as session:
@@ -463,7 +727,162 @@ class FundIntelOrchestrator:
                 return {"status": "locked"}
             impacts = self.theme_service.update_daily_strength(session, business_date)
             sig = [i for i in impacts if i.significant]
-            return {"status": "ok", "significant_count": len(sig)}
+            self._send_notifications(
+                session,
+                business_date,
+                [
+                    self._build_theme_daily_notification(
+                        business_date=business_date,
+                        impacts=impacts,
+                    )
+                ],
+                topic=Topic.THEME,
+                run_type="theme_daily",
+            )
+            return {"status": "ok", "theme_count": len(impacts), "significant_count": len(sig)}
+
+    def run_theme_auto_recover(self, *, report_date: date) -> dict[str, Any]:
+        cfg = self.settings.theme_config.get("recovery", {})
+        if not bool(cfg.get("enabled", False)):
+            return {"status": "disabled"}
+
+        lookback_business_days = max(1, int(cfg.get("lookback_business_days", 40)))
+        max_days_per_run = int(cfg.get("max_days_per_run", 3))
+        run_on_holiday = bool(cfg.get("run_on_holiday", True))
+        refresh_mapping = bool(cfg.get("refresh_mapping", True))
+        interval_sec = float(cfg.get("request_interval_sec", 0.0))
+
+        horizon_days = max(lookback_business_days * 4, 120)
+        cal_from = report_date - timedelta(days=horizon_days)
+        calendar_rows = self.jquants.fetch_calendar(cal_from, report_date + timedelta(days=14))
+        business_today = is_business_day(report_date, calendar_rows)
+        if not business_today and not run_on_holiday:
+            return {
+                "status": "holiday_skip",
+                "report_date": report_date.isoformat(),
+                "reason": "run_on_holiday=false",
+            }
+
+        if business_today:
+            end_date = report_date
+        else:
+            end_date = previous_business_day(report_date, calendar_rows)
+
+        biz_days = business_days_in_range(calendar_rows, end_date - timedelta(days=horizon_days), end_date)
+        if len(biz_days) > lookback_business_days:
+            biz_days = biz_days[-lookback_business_days:]
+        if not biz_days:
+            return {"status": "no_business_days"}
+
+        with self.db.session_scope() as session:
+            if not try_advisory_xact_lock(session, f"theme_auto_recover:{report_date}"):
+                return {"status": "locked"}
+
+            if refresh_mapping:
+                self.theme_service.weekly_discover(session, end_date, self.jquants)
+                session.flush()
+
+            theme_count = int(session.scalar(select(func.count()).select_from(Theme)) or 0)
+            if theme_count <= 0:
+                return {
+                    "status": "no_gap",
+                    "from": biz_days[0].isoformat(),
+                    "to": biz_days[-1].isoformat(),
+                    "checked_days": len(biz_days),
+                    "reason": "no_themes",
+                }
+
+            done_rows = session.execute(
+                select(ThemeStrengthDaily.asof_date, func.count())
+                .where(
+                    ThemeStrengthDaily.asof_date >= biz_days[0],
+                    ThemeStrengthDaily.asof_date <= biz_days[-1],
+                )
+                .group_by(ThemeStrengthDaily.asof_date)
+            ).all()
+            done_map = {r[0]: int(r[1] or 0) for r in done_rows if r and r[0] is not None}
+
+            missing_dates = [d for d in biz_days if done_map.get(d, 0) < theme_count]
+            if not missing_dates:
+                return {
+                    "status": "no_gap",
+                    "from": biz_days[0].isoformat(),
+                    "to": biz_days[-1].isoformat(),
+                    "checked_days": len(biz_days),
+                }
+
+            if max_days_per_run <= 0:
+                targets = missing_dates
+            else:
+                targets = missing_dates[:max_days_per_run]
+            self.logger.info(
+                "Theme auto recover start report_date=%s targets=%s",
+                report_date,
+                [d.isoformat() for d in targets],
+            )
+
+            details: list[dict[str, Any]] = []
+            repaired_days = 0
+            for idx, d in enumerate(targets, start=1):
+                impacts = self.theme_service.update_daily_strength(session, d)
+                session.flush()
+                row_count = int(
+                    session.scalar(
+                        select(func.count()).select_from(ThemeStrengthDaily).where(ThemeStrengthDaily.asof_date == d)
+                    )
+                    or 0
+                )
+                sig_count = len([i for i in impacts if i.significant])
+                day_ok = row_count >= theme_count
+                details.append(
+                    {
+                        "date": d.isoformat(),
+                        "theme_count": theme_count,
+                        "rows": row_count,
+                        "significant_count": sig_count,
+                        "recovered": day_ok,
+                    }
+                )
+                if day_ok:
+                    repaired_days += 1
+                if idx % 20 == 0 or idx == len(targets):
+                    self.logger.info(
+                        "Theme auto recover progress: %s/%s day=%s rows=%s significant=%s",
+                        idx,
+                        len(targets),
+                        d,
+                        row_count,
+                        sig_count,
+                    )
+                if interval_sec > 0:
+                    import time
+
+                    time.sleep(interval_sec)
+
+            result = {
+                "status": "ok",
+                "report_date": report_date.isoformat(),
+                "checked_days": len(biz_days),
+                "missing_days": len(missing_dates),
+                "repaired_days": repaired_days,
+                "details": details,
+            }
+            if repaired_days > 0:
+                self._send_notifications(
+                    session,
+                    report_date,
+                    [
+                        self._build_theme_recovery_notification(
+                            report_date=report_date,
+                            repaired_days=repaired_days,
+                            missing_days=len(missing_dates),
+                            details=details,
+                        )
+                    ],
+                    topic=Topic.THEME,
+                    run_type="theme_auto_recover",
+                )
+            return result
 
     def _intel_deepdive(self, session: Session, *, business_date: date, session_name: str) -> dict[str, Any]:
         budget = session.get(IntelDailyBudget, business_date)
@@ -472,19 +891,19 @@ class FundIntelOrchestrator:
             session.add(budget)
             session.flush()
 
-        if self.process_all_candidates:
-            max_run = 1_000_000
-        else:
+        max_run: int | None = None
+        if not self.process_all_candidates:
             session_cap = self.morning_cap if session_name == "morning" else self.close_cap
-            session_done = budget.morning_done if session_name == "morning" else budget.close_done
-            max_run = compute_session_allowance(
-                daily_budget=self.daily_budget,
-                session_cap=session_cap,
-                done_total=budget.done_count,
-                done_session=session_done,
-            )
-            if max_run <= 0:
-                return {"queued": 0, "done": 0, "signals": []}
+            if self.daily_budget > 0 and session_cap > 0:
+                session_done = budget.morning_done if session_name == "morning" else budget.close_done
+                max_run = compute_session_allowance(
+                    daily_budget=self.daily_budget,
+                    session_cap=session_cap,
+                    done_total=budget.done_count,
+                    done_session=session_done,
+                )
+                if max_run <= 0:
+                    return {"queued": 0, "done": 0, "signals": []}
 
         try:
             docs = self.edinet.fetch_documents_list(business_date)
@@ -506,14 +925,6 @@ class FundIntelOrchestrator:
         b_codes = self.theme_service.high_or_rising_theme_codes(session, business_date)
         candidate_codes = sorted(a_codes | b_codes)
 
-        already_seen = session.execute(
-            select(IntelQueue.code).where(
-                IntelQueue.business_date == business_date,
-                IntelQueue.status.in_(["pending", "done"]),
-            )
-        ).all()
-        seen_codes = {r[0] for r in already_seen}
-
         ranking_inputs: list[PriorityInput] = []
         for code in candidate_codes:
             fund = fund_map.get(code)
@@ -532,8 +943,8 @@ class FundIntelOrchestrator:
                     has_high_signal_tag=bool(existing_tags & self.high_signal_tags),
                 )
             )
-        ranked = [r for r in rank_priorities(ranking_inputs) if r["code"] not in seen_codes]
-        selected = ranked[:max_run]
+        ranked = rank_priorities(ranking_inputs)
+        selected = ranked if max_run is None else ranked[:max_run]
 
         # enqueue idempotently
         queued = 0
@@ -541,20 +952,54 @@ class FundIntelOrchestrator:
             code = item["code"]
             idem = build_idempotency_key(business_date.isoformat(), session_name, code)
             existing = session.scalar(select(IntelQueue).where(IntelQueue.idempotency_key == idem))
+            seed_payload = {"edinet_docs": docs_by_code.get(code, [])}
+            seed_doc_ids = _seed_doc_ids(seed_payload)
             if existing:
+                existing.priority = float(item["priority"])
+                existing_doc_ids = _seed_doc_ids(existing.sources_seed)
+                if seed_doc_ids != existing_doc_ids:
+                    existing.sources_seed = seed_payload
+                    existing.status = "pending"
+                    queued += 1
+                    self.logger.info(
+                        "Intel queue refreshed with new EDINET docs: date=%s session=%s code=%s docs_before=%s docs_after=%s",
+                        business_date,
+                        session_name,
+                        code,
+                        len(existing_doc_ids),
+                        len(seed_doc_ids),
+                    )
                 continue
             row = IntelQueue(
                 business_date=business_date,
                 session=session_name,
                 code=code,
                 priority=float(item["priority"]),
-                sources_seed={"edinet_docs": docs_by_code.get(code, [])},
+                sources_seed=seed_payload,
                 status="pending",
                 idempotency_key=idem,
             )
             session.add(row)
             queued += 1
         session.flush()
+
+        failed_stmt = select(IntelQueue).where(
+            IntelQueue.business_date == business_date,
+            IntelQueue.status == "failed",
+        )
+        if not self.process_all_candidates:
+            failed_stmt = failed_stmt.where(IntelQueue.session == session_name)
+        failed_rows = session.execute(failed_stmt).scalars().all()
+        if failed_rows:
+            for row in failed_rows:
+                row.status = "pending"
+            session.flush()
+            self.logger.info(
+                "Intel deep-dive reset failed queue rows: date=%s session=%s count=%s",
+                business_date,
+                session_name,
+                len(failed_rows),
+            )
 
         pending_stmt = (
             select(IntelQueue)
@@ -571,8 +1016,9 @@ class FundIntelOrchestrator:
         code_name_map = self._load_code_name_map(session, business_date)
         signals: list[dict[str, Any]] = []
         done = 0
-        for q in pending[:max_run]:
-            if self.process_all_candidates and self._should_pause_for_upcoming_tech(business_date):
+        loop_rows = pending if max_run is None else pending[:max_run]
+        for q in loop_rows:
+            if self._should_pause_for_upcoming_tech(business_date):
                 self.logger.info(
                     "Intel deep-dive paused for upcoming TECH run. date=%s session=%s remaining=%s",
                     business_date,
@@ -677,6 +1123,35 @@ class FundIntelOrchestrator:
             budget.close_done += done
 
         return {"queued": queued, "done": done, "signals": signals}
+
+    @staticmethod
+    def _is_intel_recovery_day_complete(
+        *,
+        sessions: list[str],
+        budget: tuple[int, int, int] | None,
+        queue_by_session: dict[str, dict[str, int]],
+    ) -> bool:
+        if budget is None:
+            return False
+        done_total, morning_done, close_done = budget
+        required_done_total = 0
+        for session_name in sessions:
+            status_counts = queue_by_session.get(session_name, {})
+            total_rows = sum(int(v or 0) for v in status_counts.values())
+            if total_rows <= 0:
+                return False
+            if int(status_counts.get("pending", 0)) > 0:
+                return False
+            if int(status_counts.get("failed", 0)) > 0:
+                return False
+            queue_done = int(status_counts.get("done", 0))
+            required_done_total += queue_done
+            budget_done = morning_done if session_name == "morning" else close_done
+            if int(budget_done or 0) < queue_done:
+                return False
+        if int(done_total or 0) < required_done_total:
+            return False
+        return True
 
     def _should_pause_for_upcoming_tech(self, business_date: date) -> bool:
         if not self.pause_for_tech:
@@ -788,8 +1263,8 @@ class FundIntelOrchestrator:
         name = names.get(code, "")
         tags = ",".join(map_tags_to_display(list(signal.get("high_signal_tags") or []), self.settings.tag_policy)) or "なし"
         hard = ",".join(list(signal.get("hard_risks") or [])) or "なし"
-        headline = _clip_text(signal.get("headline"), 120)
-        summary = _clip_text(signal.get("summary"), 220)
+        headline = _clip_text(signal.get("headline"), FUND_INTEL_DETAIL_HEADLINE_LIMIT)
+        summary = _clip_text(signal.get("summary"), FUND_INTEL_DETAIL_SUMMARY_LIMIT)
         source_url = str(signal.get("source_url") or "").strip()
         source_type = str(signal.get("source_type") or "").strip()
         published_at = str(signal.get("published_at") or "").strip()
@@ -818,12 +1293,77 @@ class FundIntelOrchestrator:
         lines.append("＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝＝")
         return "\n".join(lines)
 
+    @staticmethod
+    def _build_theme_weekly_notification(
+        *,
+        business_date: date,
+        theme_before: int,
+        theme_after: int,
+        map_before: int,
+        map_after: int,
+    ) -> str:
+        return "\n".join(
+            [
+                f"THEME週次更新 {business_date.isoformat()}",
+                f"テーマ数: {theme_before} -> {theme_after}",
+                f"紐づけ件数: {map_before} -> {map_after}",
+            ]
+        )
+
+    @staticmethod
+    def _build_theme_daily_notification(*, business_date: date, impacts: list[Any]) -> str:
+        sig = [x for x in impacts if bool(getattr(x, "significant", False))]
+        ranked = sorted(
+            impacts,
+            key=lambda x: abs(float(getattr(x, "delta", 0.0) or 0.0)),
+            reverse=True,
+        )[:5]
+        lines = [
+            f"THEME日次更新 {business_date.isoformat()}",
+            f"対象テーマ数: {len(impacts)} / 重要変化: {len(sig)}",
+        ]
+        for row in ranked:
+            name = str(getattr(row, "name", "") or "")
+            strength = float(getattr(row, "strength", 0.0) or 0.0)
+            delta = float(getattr(row, "delta", 0.0) or 0.0)
+            marker = "!" if bool(getattr(row, "significant", False)) else "-"
+            lines.append(f"{marker} {name}: 強度={strength:.3f} Δ={delta:+.3f}")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _build_theme_recovery_notification(
+        *,
+        report_date: date,
+        repaired_days: int,
+        missing_days: int,
+        details: list[dict[str, Any]],
+    ) -> str:
+        sample_days = ", ".join([str(d.get("date")) for d in details[:5]])
+        return "\n".join(
+            [
+                f"THEME復旧 {report_date.isoformat()}",
+                f"復旧日数: {repaired_days} / 欠損検出日数: {missing_days}",
+                f"復旧サンプル: {sample_days or '-'}",
+            ]
+        )
+
     def _build_proposal_notifications(self, session: Session, business_date: date) -> list[str]:
-        fund_rows, intel_rows = self._fetch_new_proposals(session, business_date)
-        if not fund_rows and not intel_rows:
+        tech_rows, fund_rows, intel_rows = self._fetch_new_proposals(session, business_date)
+        if not tech_rows and not fund_rows and not intel_rows:
             return []
 
         lines: list[str] = [f"Proposals {business_date.isoformat()}"]
+        for row in tech_rows:
+            suggestion_text = str(row.suggestion_text or "").strip()
+            if self._is_placeholder_proposal_text(suggestion_text):
+                continue
+            code = str(row.code or "").strip()
+            code_label = f" code={code}" if code else ""
+            lines.append(f"- [tech] id={row.id}{code_label} status={row.status}")
+            lines.append(f"  - suggestion: {suggestion_text[:240]}")
+            for diff_line in self._proposal_diff_summary(row.raw_json):
+                lines.append(f"  {diff_line}")
+
         for row in fund_rows:
             lines.append(f"- [fund] id={row.proposal_id} scope={row.scope}")
             for diff_line in self._proposal_diff_summary(row.diff):
@@ -838,6 +1378,8 @@ class FundIntelOrchestrator:
             for diff_line in self._proposal_diff_summary(row.diff):
                 lines.append(f"  {diff_line}")
 
+        if len(lines) == 1:
+            return []
         body = "\n".join(lines)
         return [body]
 
@@ -865,9 +1407,22 @@ class FundIntelOrchestrator:
             )
 
     @staticmethod
-    def _fetch_new_proposals(session: Session, business_date: date) -> tuple[list[FundRuleSuggestion], list[IntelRuleSuggestion]]:
+    def _fetch_new_proposals(
+        session: Session,
+        business_date: date,
+    ) -> tuple[list[RuleSuggestion], list[FundRuleSuggestion], list[IntelRuleSuggestion]]:
         boundary = datetime.combine(business_date, datetime.min.time())
         next_boundary = boundary.replace(hour=23, minute=59, second=59)
+        tech = (
+            session.execute(
+                select(RuleSuggestion).where(
+                    RuleSuggestion.created_at >= boundary,
+                    RuleSuggestion.created_at <= next_boundary,
+                )
+            )
+            .scalars()
+            .all()
+        )
         fund = (
             session.execute(
                 select(FundRuleSuggestion).where(
@@ -888,7 +1443,7 @@ class FundIntelOrchestrator:
             .scalars()
             .all()
         )
-        return fund, intel
+        return tech, fund, intel
 
     @staticmethod
     def _proposal_diff_summary(diff: Any) -> list[str]:
@@ -899,6 +1454,27 @@ class FundIntelOrchestrator:
         if diff is None:
             return []
         return [f"- {str(diff)[:160]}"]
+
+    @staticmethod
+    def _is_placeholder_proposal_text(value: Any) -> bool:
+        text = str(value or "").strip().lower()
+        return text in {
+            "",
+            "-",
+            "n/a",
+            "na",
+            "none",
+            "null",
+            "unknown",
+            "tbd",
+            "not available",
+            "not_applicable",
+            "\u672a\u53d6\u5f97",
+            "\u306a\u3057",
+            "\u7121\u3057",
+            "\u8a72\u5f53\u306a\u3057",
+            "\u63d0\u6848\u306a\u3057",
+        }
 
     @staticmethod
     def _normalize_fact_items(value: Any, *, limit: int = 3) -> list[str]:

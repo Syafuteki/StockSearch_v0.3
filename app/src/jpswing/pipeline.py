@@ -96,7 +96,11 @@ _TEXT_PLACEHOLDERS = {
     "tbd",
     "not available",
     "not_applicable",
-    "未取得",
+    "\u672a\u53d6\u5f97",
+    "\u306a\u3057",
+    "\u7121\u3057",
+    "\u8a72\u5f53\u306a\u3057",
+    "\u63d0\u6848\u306a\u3057",
 }
 
 
@@ -248,7 +252,8 @@ def _normalize_single_candidate_result(
         rs = parsed.get("rule_suggestion")
         if rs is not None:
             text = str(rs).strip()
-            rule_suggestion = text or None
+            if text and not _is_placeholder_text(text):
+                rule_suggestion = text
 
     return {
         "code": code,
@@ -537,7 +542,7 @@ class SwingPipeline:
             return {"status": "disabled"}
 
         lookback_business_days = max(1, int(cfg.get("lookback_business_days", 40)))
-        max_days_per_run = max(1, int(cfg.get("max_days_per_run", 3)))
+        max_days_per_run = int(cfg.get("max_days_per_run", 3))
         mode = str(cfg.get("mode", "close_only")).strip() or "close_only"
         run_on_holiday = bool(cfg.get("run_on_holiday", True))
 
@@ -564,7 +569,7 @@ class SwingPipeline:
             return {"status": "no_business_days"}
 
         with self.db.session_scope() as session:
-            done_rows = session.execute(
+            done_rows_screen = session.execute(
                 select(ScreenTop30Daily.trade_date)
                 .where(
                     ScreenTop30Daily.trade_date >= biz_days[0],
@@ -572,7 +577,17 @@ class SwingPipeline:
                 )
                 .distinct()
             ).all()
-        done_dates = {r[0] for r in done_rows if r and r[0] is not None}
+            done_rows_shortlist = session.execute(
+                select(ShortlistTop10Daily.trade_date)
+                .where(
+                    ShortlistTop10Daily.trade_date >= biz_days[0],
+                    ShortlistTop10Daily.trade_date <= biz_days[-1],
+                )
+                .distinct()
+            ).all()
+        done_dates_screen = {r[0] for r in done_rows_screen if r and r[0] is not None}
+        done_dates_shortlist = {r[0] for r in done_rows_shortlist if r and r[0] is not None}
+        done_dates = done_dates_screen & done_dates_shortlist
         missing_dates = [d for d in biz_days if d not in done_dates]
         if not missing_dates:
             return {
@@ -582,7 +597,10 @@ class SwingPipeline:
                 "checked_days": len(biz_days),
             }
 
-        targets = missing_dates[:max_days_per_run]
+        if max_days_per_run <= 0:
+            targets = missing_dates
+        else:
+            targets = missing_dates[:max_days_per_run]
         self.logger.info(
             "Auto recover start report_date=%s mode=%s targets=%s",
             report_date,
@@ -595,11 +613,19 @@ class SwingPipeline:
         }
         run_types = mode_map.get(mode, ["close"])
         repaired: list[dict[str, Any]] = []
+        repaired_days = 0
         for d in targets:
             row: dict[str, Any] = {"date": d.isoformat(), "runs": {}}
+            day_ok = True
             for rt in run_types:
                 result = self.run(rt, d, run_post_hooks=False)
-                row["runs"][rt] = str(result.get("status"))
+                status = str(result.get("status"))
+                row["runs"][rt] = status
+                if status != "ok":
+                    day_ok = False
+            row["recovered"] = day_ok
+            if day_ok:
+                repaired_days += 1
             repaired.append(row)
         return {
             "status": "ok",
@@ -607,7 +633,7 @@ class SwingPipeline:
             "mode": mode,
             "checked_days": len(biz_days),
             "missing_days": len(missing_dates),
-            "repaired_days": len(targets),
+            "repaired_days": repaired_days,
             "details": repaired,
         }
 
@@ -1090,7 +1116,7 @@ class SwingPipeline:
     ) -> None:
         for code, info in llm_map.items():
             suggestion = info.get("rule_suggestion")
-            if not suggestion:
+            if not suggestion or _is_placeholder_text(suggestion):
                 continue
             session.add(
                 RuleSuggestion(

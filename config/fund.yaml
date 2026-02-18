@@ -35,7 +35,7 @@ recovery:
   enabled: true
   run_on_startup: true
   lookback_business_days: 40
-  max_days_per_run: 3
+  max_days_per_run: 0
   run_on_holiday: true
   force: false
   request_interval_sec: 0.0

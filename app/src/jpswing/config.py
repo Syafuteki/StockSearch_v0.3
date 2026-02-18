@@ -32,6 +32,7 @@ class JQuantsConfig(BaseModel):
 
 class DiscordWebhooksConfig(BaseModel):
     tech: str = ""
+    theme: str = ""
     fund_intel: str = ""
     fund_intel_flash: str = ""
     fund_intel_detail: str = ""
@@ -40,6 +41,7 @@ class DiscordWebhooksConfig(BaseModel):
 
 class DiscordThreadsConfig(BaseModel):
     tech: str | None = None
+    theme: str | None = None
     fund_intel: str | None = None
     fund_intel_flash: str | None = None
     fund_intel_detail: str | None = None
@@ -186,6 +188,7 @@ def _apply_env_overrides(app_cfg: dict[str, Any]) -> dict[str, Any]:
         ("jquants", "api_key"): "JQUANTS_API_KEY",
         ("discord", "webhook_url"): "DISCORD_WEBHOOK_URL",
         ("discord", "webhooks", "tech"): "DISCORD_WEBHOOK_TECH",
+        ("discord", "webhooks", "theme"): "DISCORD_WEBHOOK_THEME",
         ("discord", "webhooks", "fund_intel"): "DISCORD_WEBHOOK_FUND_INTEL",
         ("discord", "webhooks", "fund_intel_flash"): "DISCORD_WEBHOOK_FUND_INTEL_FLASH",
         ("discord", "webhooks", "fund_intel_detail"): "DISCORD_WEBHOOK_FUND_INTEL_DETAIL",

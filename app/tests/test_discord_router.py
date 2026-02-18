@@ -1,6 +1,6 @@
 ﻿from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime
 from types import SimpleNamespace
 from typing import Any
 
@@ -8,7 +8,7 @@ import httpx
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 
-from jpswing.db.models import FundRuleSuggestion, IntelRuleSuggestion
+from jpswing.db.models import FundRuleSuggestion, IntelRuleSuggestion, RuleSuggestion
 from jpswing.fund_intel_orchestrator import FundIntelOrchestrator
 from jpswing.notify.discord_router import DiscordRouter, Topic, chunk_embeds, split_discord_content
 
@@ -29,6 +29,7 @@ def test_router_routes_to_topic_webhooks(monkeypatch: Any) -> None:
     router = DiscordRouter(
         webhooks={
             Topic.TECH.value: "https://discord.example/tech",
+            Topic.THEME.value: "https://discord.example/theme",
             Topic.FUND_INTEL.value: "https://discord.example/fund-legacy",
             Topic.FUND_INTEL_FLASH.value: "https://discord.example/fund-flash",
             Topic.FUND_INTEL_DETAIL.value: "https://discord.example/fund-detail",
@@ -37,14 +38,16 @@ def test_router_routes_to_topic_webhooks(monkeypatch: Any) -> None:
     )
 
     assert router.send(Topic.TECH, {"content": "a"})[0]
-    assert router.send(Topic.FUND_INTEL_FLASH, {"content": "b"})[0]
-    assert router.send(Topic.FUND_INTEL_DETAIL, {"content": "c"})[0]
-    assert router.send(Topic.PROPOSALS, {"content": "d"})[0]
+    assert router.send(Topic.THEME, {"content": "b"})[0]
+    assert router.send(Topic.FUND_INTEL_FLASH, {"content": "c"})[0]
+    assert router.send(Topic.FUND_INTEL_DETAIL, {"content": "d"})[0]
+    assert router.send(Topic.PROPOSALS, {"content": "e"})[0]
 
     assert called_urls[0].startswith("https://discord.example/tech")
-    assert called_urls[1].startswith("https://discord.example/fund-flash")
-    assert called_urls[2].startswith("https://discord.example/fund-detail")
-    assert called_urls[3].startswith("https://discord.example/proposals")
+    assert called_urls[1].startswith("https://discord.example/theme")
+    assert called_urls[2].startswith("https://discord.example/fund-flash")
+    assert called_urls[3].startswith("https://discord.example/fund-detail")
+    assert called_urls[4].startswith("https://discord.example/proposals")
 
 
 def test_router_from_config_fund_intel_flash_detail_fallback_to_legacy() -> None:
@@ -52,6 +55,7 @@ def test_router_from_config_fund_intel_flash_detail_fallback_to_legacy() -> None
         webhook_url="",
         webhooks=SimpleNamespace(
             tech="https://discord.example/tech",
+            theme="",
             fund_intel="https://discord.example/fund-legacy",
             fund_intel_flash="",
             fund_intel_detail="",
@@ -59,6 +63,7 @@ def test_router_from_config_fund_intel_flash_detail_fallback_to_legacy() -> None
         ),
         threads=SimpleNamespace(
             tech=None,
+            theme=None,
             fund_intel="111",
             fund_intel_flash=None,
             fund_intel_detail=None,
@@ -66,8 +71,10 @@ def test_router_from_config_fund_intel_flash_detail_fallback_to_legacy() -> None
         ),
     )
     router = DiscordRouter.from_config(discord_cfg)
+    assert router.webhooks[Topic.THEME.value] == "https://discord.example/fund-legacy"
     assert router.webhooks[Topic.FUND_INTEL_FLASH.value] == "https://discord.example/fund-legacy"
     assert router.webhooks[Topic.FUND_INTEL_DETAIL.value] == "https://discord.example/fund-legacy"
+    assert router.threads[Topic.THEME.value] == "111"
     assert router.threads[Topic.FUND_INTEL_FLASH.value] == "111"
     assert router.threads[Topic.FUND_INTEL_DETAIL.value] == "111"
 
@@ -113,6 +120,7 @@ def test_router_retries_on_429_with_retry_after(monkeypatch: Any) -> None:
 
 def test_noop_proposal_notification_when_no_rows() -> None:
     engine = create_engine("sqlite:///:memory:", future=True)
+    RuleSuggestion.__table__.create(engine)
     FundRuleSuggestion.__table__.create(engine)
     IntelRuleSuggestion.__table__.create(engine)
 
@@ -120,6 +128,36 @@ def test_noop_proposal_notification_when_no_rows() -> None:
     with Session(engine) as session:
         messages = FundIntelOrchestrator._build_proposal_notifications(orch, session, date(2026, 2, 14))
     assert messages == []
+
+
+def test_proposal_notification_includes_tech_rows() -> None:
+    engine = create_engine("sqlite:///:memory:", future=True)
+    RuleSuggestion.__table__.create(engine)
+    FundRuleSuggestion.__table__.create(engine)
+    IntelRuleSuggestion.__table__.create(engine)
+
+    with Session(engine) as session:
+        session.add(
+            RuleSuggestion(
+                report_date=date(2026, 2, 14),
+                code="72030",
+                suggestion_text="RSI閾値を見直す提案",
+                source_llm_run_id=None,
+                status="pending",
+                raw_json={"rule_suggestion": "RSI>80の減点を緩和"},
+                created_at=datetime(2026, 2, 14, 12, 0, 0),
+            )
+        )
+        session.commit()
+
+    orch = object.__new__(FundIntelOrchestrator)
+    with Session(engine) as session:
+        messages = FundIntelOrchestrator._build_proposal_notifications(orch, session, date(2026, 2, 14))
+    assert len(messages) == 1
+    body = messages[0]
+    assert "- [tech] id=" in body
+    assert "code=72030" in body
+    assert "RSI閾値を見直す提案" in body
 
 
 def test_noop_fund_intel_notification_when_no_signal() -> None:
