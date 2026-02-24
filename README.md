@@ -252,7 +252,8 @@ THEME:
 
 - 週次でテーマ定義/銘柄マップ更新
 - 日次でThemeStrength更新
-- 実行ごとにDiscordへサマリー通知（`Topic.FUND_INTEL`）
+- 実行ごとにDiscordへ通知（`Topic.THEME`）
+- `theme_auto_recover` 実行時は、復旧できた各営業日の `THEME日次更新(復旧)` に加えて復旧サマリも送信
 
 INTEL:
 

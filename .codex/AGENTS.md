@@ -15,19 +15,20 @@
 - RAG: `kb/` と承認済みアイテムの索引化
 
 ## 3. スケジュール（現在設定）
-- TECH morning: `0 8 * * 1-5`
-- TECH close: `30 15 * * 1-5`
+- TECH morning: `disabled`（`scheduler.morning_cron: ""`）
+- TECH close: `0 17 * * 1-5`
 - FUND weekly: `0 7 * * 1`
 - FUND daily refresh: `10 7 * * 1-5`
-- THEME weekly: `20 7 * * 1`
-- THEME daily: `40 7 * * 1-5`
+- THEME weekly: `0 17 * * 0`（日曜 17:00）
+- THEME daily: `0 16 * * 1-5`
 - INTEL background: `*/20 * * * *`（有効時）
 - AUTO recovery: `15 * * * 1-5`（有効時）
+- Startup catch-up step: `*/2 * * * *`（有効時）
 
 起動時回復:
-- app起動後は TECH -> FUND の順でキャッチアップ（欠損営業日を段階的に回復）
-- キャッチアップ完了までは INTEL background を自動スキップ
-- TECH/FUND 定時実行が近い時間帯は一時停止し、定時処理後に再開
+- app起動後は `TECH -> FUND -> THEME -> INTEL` の順でキャッチアップ（欠損営業日を段階的に回復）
+- キャッチアップ完了までは `INTEL background` を自動スキップ
+- `TECH/FUND/THEME` 定時実行が近い時間帯は一時停止し、定時処理後に再開
 
 補足:
 - INTEL background は `intel.yaml` の `run_on_holiday: true` 時、休場日でも実行可。
@@ -42,14 +43,20 @@
   - `docker compose run --rm app python -m jpswing.main --once --run-type fund_weekly --date YYYY-MM-DD`
 - FUND daily:
   - `docker compose run --rm app python -m jpswing.main --once --run-type fund_daily --date YYYY-MM-DD`
+- FUND backfill:
+  - `docker compose run --rm app python -m jpswing.main --once --run-type fund_backfill --date YYYY-MM-DD`
 - FUND auto recover:
   - `docker compose run --rm app python -m jpswing.main --once --run-type fund_auto_recover --date YYYY-MM-DD`
 - THEME weekly:
   - `docker compose run --rm app python -m jpswing.main --once --run-type theme_weekly --date YYYY-MM-DD`
 - THEME daily:
   - `docker compose run --rm app python -m jpswing.main --once --run-type theme_daily --date YYYY-MM-DD`
+- THEME auto recover:
+  - `docker compose run --rm app python -m jpswing.main --once --run-type theme_auto_recover --date YYYY-MM-DD`
 - INTEL background:
   - `docker compose run --rm app python -m jpswing.main --once --run-type intel_background --date YYYY-MM-DD`
+- INTEL auto recover:
+  - `docker compose run --rm app python -m jpswing.main --once --run-type intel_auto_recover --date YYYY-MM-DD`
 - AUTO recovery:
   - `docker compose run --rm app python -m jpswing.main --once --run-type auto_recover --date YYYY-MM-DD`
 - 日付範囲回復:
@@ -85,6 +92,7 @@
 
 ## 6. Discord通知ルーティング
 - `DISCORD_WEBHOOK_TECH`
+- `DISCORD_WEBHOOK_THEME`
 - `DISCORD_WEBHOOK_FUND_INTEL`
 - `DISCORD_WEBHOOK_FUND_INTEL_FLASH`
 - `DISCORD_WEBHOOK_FUND_INTEL_DETAIL`
@@ -92,11 +100,13 @@
 
 Topic対応:
 - `Topic.TECH` -> TECH webhook
+- `Topic.THEME` -> THEME webhook
 - `Topic.FUND_INTEL_FLASH` -> FUND速報 webhook
 - `Topic.FUND_INTEL_DETAIL` -> FUND深掘り webhook
 - `Topic.PROPOSALS` -> proposals webhook
 
 フォールバック:
+- `THEME` 未設定時は `FUND_INTEL` を使用
 - `FUND_INTEL_FLASH` 未設定時は `FUND_INTEL` を使用
 - `FUND_INTEL_DETAIL` 未設定時は `FUND_INTEL` を使用
 
@@ -106,6 +116,12 @@ Topic対応:
   - 高シグナルタグの新規付与
   - FUND state 変化（IN/WATCH/OUT）
 - 深掘り通知（FUND_INTEL_DETAIL）は深掘り1件ごとに送信
+
+THEME通知:
+- `THEME週次更新`: テーマ数 / 紐づけ件数
+- `THEME日次更新`: 対象テーマ数 / 重要変化数 / 上位5テーマ
+- `THEME日次更新(復旧)`: THEME回復で復旧できた営業日ごと
+- `THEME復旧`: 復旧日数 / 欠損検出日数 / 復旧サンプル日
 
 補足:
 - TECHのLLM評価は「Top30を1銘柄ずつ」実行し、`confidence_0_100` と Step2順位でTop10を決定。

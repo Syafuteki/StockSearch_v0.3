@@ -52,8 +52,8 @@ class DiscordConfig(BaseModel):
     webhook_url: str = ""
     webhooks: DiscordWebhooksConfig = Field(default_factory=DiscordWebhooksConfig)
     threads: DiscordThreadsConfig = Field(default_factory=DiscordThreadsConfig)
-    max_message_chars: int = 1900
-    split_max_parts: int = 2
+    max_message_chars: int = 1500
+    split_max_parts: int = 4
 
 
 class LlmConfig(BaseModel):
@@ -181,6 +181,30 @@ def _env_to_bool(raw: str | None) -> bool | None:
     return None
 
 
+def _env_to_int(raw: str | None) -> int | None:
+    if raw is None:
+        return None
+    text = raw.strip()
+    if not text:
+        return None
+    try:
+        return int(text)
+    except ValueError:
+        return None
+
+
+def _env_to_float(raw: str | None) -> float | None:
+    if raw is None:
+        return None
+    text = raw.strip()
+    if not text:
+        return None
+    try:
+        return float(text)
+    except ValueError:
+        return None
+
+
 def _apply_env_overrides(app_cfg: dict[str, Any]) -> dict[str, Any]:
     out = copy.deepcopy(app_cfg)
     env_map = {
@@ -196,6 +220,8 @@ def _apply_env_overrides(app_cfg: dict[str, Any]) -> dict[str, Any]:
         ("llm", "base_url"): "LMSTUDIO_BASE_URL",
         ("llm", "api_key"): "LMSTUDIO_API_KEY",
         ("llm", "model_name"): "LLM_MODEL_NAME",
+        ("llm", "temperature"): "LLM_TEMPERATURE",
+        ("llm", "timeout_sec"): "LLM_TIMEOUT_SEC",
         ("external_fx", "alpha_vantage_api_key"): "ALPHAVANTAGE_API_KEY",
         ("edinet", "base_url"): "EDINET_BASE_URL",
         ("edinet", "api_key"): "EDINET_API_KEY",
@@ -251,6 +277,37 @@ def load_settings(config_dir: str | Path = "config") -> Settings:
         intel.setdefault("search", {})
         if isinstance(intel["search"], dict):
             intel["search"]["use_mcp"] = mcp_bool
+    mcp_ctx_len = _env_to_int(os.getenv("INTEL_MCP_CONTEXT_LENGTH"))
+    if mcp_ctx_len is not None:
+        intel.setdefault("search", {})
+        if isinstance(intel["search"], dict):
+            intel["search"]["mcp_context_length"] = mcp_ctx_len
+    lmstudio_chat_endpoint = os.getenv("INTEL_LMSTUDIO_CHAT_ENDPOINT")
+    if lmstudio_chat_endpoint:
+        intel.setdefault("search", {})
+        if isinstance(intel["search"], dict):
+            intel["search"]["lmstudio_chat_endpoint"] = lmstudio_chat_endpoint
+
+    intel_llm_model = os.getenv("INTEL_LLM_MODEL_NAME")
+    if intel_llm_model:
+        intel.setdefault("llm", {})
+        if isinstance(intel["llm"], dict):
+            intel["llm"]["model_name"] = intel_llm_model
+    intel_llm_temp = _env_to_float(os.getenv("INTEL_LLM_TEMPERATURE"))
+    if intel_llm_temp is not None:
+        intel.setdefault("llm", {})
+        if isinstance(intel["llm"], dict):
+            intel["llm"]["temperature"] = intel_llm_temp
+    intel_llm_timeout = _env_to_int(os.getenv("INTEL_LLM_TIMEOUT_SEC"))
+    if intel_llm_timeout is not None:
+        intel.setdefault("llm", {})
+        if isinstance(intel["llm"], dict):
+            intel["llm"]["timeout_sec"] = intel_llm_timeout
+    intel_llm_retries = _env_to_int(os.getenv("INTEL_LLM_RETRIES"))
+    if intel_llm_retries is not None:
+        intel.setdefault("llm", {})
+        if isinstance(intel["llm"], dict):
+            intel["llm"]["retries"] = intel_llm_retries
 
     merged_app = _deep_merge(AppConfig().model_dump(), app_yaml)
     if isinstance(notify, dict) and isinstance(notify.get("discord"), dict):

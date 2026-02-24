@@ -4,6 +4,7 @@ import logging
 import time
 from datetime import date
 from typing import Any
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -18,18 +19,33 @@ class EdinetClient:
         self.logger = logging.getLogger(self.__class__.__name__)
 
     def _headers(self) -> dict[str, str]:
-        headers: dict[str, str] = {}
-        if self.api_key:
-            headers["Subscription-Key"] = self.api_key
-        return headers
+        return {}
 
-    def _candidate_base_urls(self) -> list[str]:
-        current = self.base_url.rstrip("/")
-        fallbacks = [
-            "https://api.edinet-fsa.go.jp",
-            "https://disclosure.edinet-fsa.go.jp",
-            "https://disclosure2.edinet-fsa.go.jp",
-        ]
+    def _auth_params(self, params: dict[str, Any]) -> dict[str, Any]:
+        out = dict(params)
+        if self.api_key:
+            # EDINET list/download APIs currently accept the subscription key via query param.
+            out["Subscription-Key"] = self.api_key
+        return out
+
+    @staticmethod
+    def _origin(url: str) -> str:
+        raw = (url or "").strip().rstrip("/")
+        parsed = urlsplit(raw)
+        if parsed.scheme and parsed.netloc:
+            return f"{parsed.scheme}://{parsed.netloc}"
+        return raw
+
+    def _candidate_base_urls(self, *, api_only: bool = False) -> list[str]:
+        current = self._origin(self.base_url)
+        fallbacks = ["https://api.edinet-fsa.go.jp"]
+        if not api_only:
+            fallbacks.extend(
+                [
+                    "https://disclosure.edinet-fsa.go.jp",
+                    "https://disclosure2.edinet-fsa.go.jp",
+                ]
+            )
         out = [current]
         for base in fallbacks:
             if base not in out:
@@ -64,15 +80,15 @@ class EdinetClient:
             return 1.0
 
     def fetch_documents_list(self, target_date: date, doc_type: int = 2) -> list[dict[str, Any]]:
-        params = {"date": target_date.isoformat(), "type": doc_type}
+        params = self._auth_params({"date": target_date.isoformat(), "type": doc_type})
 
         def _run() -> list[dict[str, Any]]:
-            for base_url in self._candidate_base_urls():
+            for base_url in self._candidate_base_urls(api_only=True):
                 endpoint = f"{base_url}/api/v2/documents.json"
                 response = httpx.get(
                     endpoint,
                     params=params,
-                    headers=self._headers(),
+                    headers={**self._headers(), "Accept": "application/json"},
                     timeout=self.timeout_sec,
                     follow_redirects=False,
                 )
@@ -89,11 +105,13 @@ class EdinetClient:
                     raise RuntimeError(f"EDINET temporary error: {response.status_code}")
                 if response.status_code in {301, 302, 303, 307, 308}:
                     location = response.headers.get("Location", "")
+                    aspx_redirect = ".aspx" in location.lower()
                     self.logger.warning(
-                        "EDINET redirect on %s status=%s location=%s",
+                        "EDINET documents redirect on %s status=%s location=%s aspx_redirect=%s",
                         base_url,
                         response.status_code,
                         location,
+                        aspx_redirect,
                     )
                     continue
                 if response.status_code in {400, 401, 403, 404}:
@@ -107,19 +125,29 @@ class EdinetClient:
                 response.raise_for_status()
                 payload = response.json()
                 if not isinstance(payload, dict):
+                    self.logger.warning(
+                        "EDINET documents invalid payload on %s payload_type=%s",
+                        base_url,
+                        type(payload).__name__,
+                    )
                     continue
                 results = payload.get("results")
                 if isinstance(results, list):
                     return [r for r in results if isinstance(r, dict)]
+                self.logger.warning(
+                    "EDINET documents payload missing results list on %s keys=%s",
+                    base_url,
+                    sorted(payload.keys())[:20],
+                )
             return []
 
         return retry_with_backoff(_run, retries=3, base_delay_sec=1.2, backoff=2.0, logger=self.logger)
 
     def download_document(self, doc_id: str, file_type: int = 5) -> bytes:
-        params = {"type": file_type}
+        params = self._auth_params({"type": file_type})
 
         def _run() -> bytes:
-            for base_url in self._candidate_base_urls():
+            for base_url in self._candidate_base_urls(api_only=False):
                 endpoint = f"{base_url}/api/v2/documents/{doc_id}"
                 response = httpx.get(
                     endpoint,

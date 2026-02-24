@@ -19,8 +19,8 @@ jquants:
     max_wait_minutes: 180
 
 discord:
-  max_message_chars: 1900
-  split_max_parts: 2
+  max_message_chars: 1500
+  split_max_parts: 4
 
 llm:
   base_url: "http://host.docker.internal:1234/v1"

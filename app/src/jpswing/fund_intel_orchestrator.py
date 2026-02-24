@@ -184,13 +184,15 @@ class FundIntelOrchestrator:
         self.high_signal_tags = set(intel_cfg.get("notify", {}).get("high_signal_tags", []))
         self.risk_hard_keys = set(intel_cfg.get("notify", {}).get("risk_hard_keys", []))
         llm_cfg = intel_cfg.get("llm", {})
+        intel_model = str(llm_cfg.get("model_name") or settings.app_config.llm.model_name)
+        intel_timeout_sec = int(llm_cfg.get("timeout_sec", settings.app_config.llm.timeout_sec))
         mcp_integrations = _normalize_mcp_integrations(search_cfg)
         self.intel_llm = IntelLlmClient(
             base_url=settings.app_config.llm.base_url,
-            model=settings.app_config.llm.model_name,
+            model=intel_model,
             api_key=settings.app_config.llm.api_key,
             temperature=float(llm_cfg.get("temperature", 0.0)),
-            timeout_sec=settings.app_config.llm.timeout_sec,
+            timeout_sec=intel_timeout_sec,
             retries=int(llm_cfg.get("retries", 2)),
             use_mcp=bool(search_cfg.get("use_mcp", False)),
             mcp_integrations=mcp_integrations,
@@ -823,6 +825,7 @@ class FundIntelOrchestrator:
 
             details: list[dict[str, Any]] = []
             repaired_days = 0
+            recovery_daily_messages: list[str] = []
             for idx, d in enumerate(targets, start=1):
                 impacts = self.theme_service.update_daily_strength(session, d)
                 session.flush()
@@ -845,6 +848,13 @@ class FundIntelOrchestrator:
                 )
                 if day_ok:
                     repaired_days += 1
+                    recovery_daily_messages.append(
+                        self._build_theme_daily_notification(
+                            business_date=d,
+                            impacts=impacts,
+                            recovery=True,
+                        )
+                    )
                 if idx % 20 == 0 or idx == len(targets):
                     self.logger.info(
                         "Theme auto recover progress: %s/%s day=%s rows=%s significant=%s",
@@ -871,7 +881,8 @@ class FundIntelOrchestrator:
                 self._send_notifications(
                     session,
                     report_date,
-                    [
+                    recovery_daily_messages
+                    + [
                         self._build_theme_recovery_notification(
                             report_date=report_date,
                             repaired_days=repaired_days,
@@ -1311,15 +1322,16 @@ class FundIntelOrchestrator:
         )
 
     @staticmethod
-    def _build_theme_daily_notification(*, business_date: date, impacts: list[Any]) -> str:
+    def _build_theme_daily_notification(*, business_date: date, impacts: list[Any], recovery: bool = False) -> str:
         sig = [x for x in impacts if bool(getattr(x, "significant", False))]
         ranked = sorted(
             impacts,
             key=lambda x: abs(float(getattr(x, "delta", 0.0) or 0.0)),
             reverse=True,
         )[:5]
+        title = "THEME日次更新(復旧)" if recovery else "THEME日次更新"
         lines = [
-            f"THEME日次更新 {business_date.isoformat()}",
+            f"{title} {business_date.isoformat()}",
             f"対象テーマ数: {len(impacts)} / 重要変化: {len(sig)}",
         ]
         for row in ranked:
@@ -1512,11 +1524,28 @@ class FundIntelOrchestrator:
 
     @staticmethod
     def _load_code_name_map(session: Session, business_date: date) -> dict[str, str]:
-        rows = session.execute(select(Instrument.code, Instrument.name).where(Instrument.as_of_date == business_date)).all()
         out: dict[str, str] = {}
-        for code, name in rows:
+        exact_rows = session.execute(
+            select(Instrument.code, Instrument.name).where(Instrument.as_of_date == business_date)
+        ).all()
+        for code, name in exact_rows:
             if code is None:
                 continue
             out[str(code)] = str(name or "")
+
+        # FUND/Intel can run on dates where TECH did not persist an instrument snapshot.
+        # In that case, fall back to the latest available snapshot on or before business_date.
+        if not exact_rows:
+            fallback_date = session.scalar(
+                select(func.max(Instrument.as_of_date)).where(Instrument.as_of_date <= business_date)
+            )
+            if fallback_date is not None:
+                fallback_rows = session.execute(
+                    select(Instrument.code, Instrument.name).where(Instrument.as_of_date == fallback_date)
+                ).all()
+                for code, name in fallback_rows:
+                    if code is None:
+                        continue
+                    out[str(code)] = str(name or "")
         return out
 
