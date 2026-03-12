@@ -1058,8 +1058,10 @@ class FundIntelOrchestrator:
             ]
             fund = fund_map.get(code)
             existing_tags = list((fund.tags or {}).get("items", []) if fund and isinstance(fund.tags, dict) else [])
+            company_name = str(code_name_map.get(code) or "").strip()
             payload, valid, err = self.intel_llm.summarize_symbol_intel(
                 code=code,
+                company_name=company_name,
                 source_payload=source_payload,
                 existing_tags=existing_tags,
             )
@@ -1080,6 +1082,11 @@ class FundIntelOrchestrator:
                 session.add(item)
                 session.flush()
 
+                fund_state_row = session.get(FundUniverseState, code)
+                fund_state_before = None
+                if fund_state_row is not None and getattr(fund_state_row, "state", None) is not None:
+                    fund_state_before = str(fund_state_row.state)
+
                 changed_fund = self.fund_service.apply_intel_aggregate(
                     session,
                     code=code,
@@ -1088,6 +1095,9 @@ class FundIntelOrchestrator:
                     critical_risk=bool(payload.get("critical_risk")),
                     evidence_refs=list(payload.get("evidence_refs", [])),
                 )
+                fund_state_after = None
+                if fund_state_row is not None and getattr(fund_state_row, "state", None) is not None:
+                    fund_state_after = str(fund_state_row.state)
                 q.status = "done"
                 done += 1
 
@@ -1099,6 +1109,8 @@ class FundIntelOrchestrator:
                     "high_signal_tags": new_high_signal,
                     "hard_risks": sorted(hard_risks),
                     "fund_state_changed": changed_fund,
+                    "fund_state_before": fund_state_before,
+                    "fund_state_after": fund_state_after,
                     "headline": str(payload.get("headline") or ""),
                     "summary": str(payload.get("summary") or ""),
                     "source_url": str(payload.get("source_url") or ""),
@@ -1510,6 +1522,8 @@ class FundIntelOrchestrator:
         hard_risks = list(signal.get("hard_risks") or [])
         high_tags = list(signal.get("high_signal_tags") or [])
         fund_changed = bool(signal.get("fund_state_changed"))
+        fund_before = str(signal.get("fund_state_before") or "").strip()
+        fund_after = str(signal.get("fund_state_after") or "").strip()
         if critical:
             return "ネガティブ（重大リスク☠️）"
         if hard_risks and high_tags:
@@ -1519,6 +1533,11 @@ class FundIntelOrchestrator:
         if high_tags:
             return "ポジティブ（注目タグ）"
         if fund_changed:
+            if fund_before or fund_after:
+                before_label = fund_before or "-"
+                after_label = fund_after or "-"
+                if before_label != after_label:
+                    return f"状態変化（FUND判定更新: {before_label} -> {after_label}）"
             return "状態変化（FUND判定更新）"
         return "中立"
 

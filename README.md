@@ -72,8 +72,21 @@ docker compose ps
 - `DATABASE_URL`
 - `JQUANTS_API_KEY`
 - `EDINET_API_KEY`
+
+LM Studio / 共通LLM:
+
 - `LMSTUDIO_BASE_URL`
+- `LMSTUDIO_API_KEY`
 - `LLM_MODEL_NAME`
+- `LLM_TEMPERATURE`
+- `LLM_TIMEOUT_SEC`
+
+Intel専用LLM上書き:
+
+- `INTEL_LLM_MODEL_NAME`
+- `INTEL_LLM_TEMPERATURE`
+- `INTEL_LLM_TIMEOUT_SEC`
+- `INTEL_LLM_RETRIES`
 
 Discord通知:
 
@@ -90,10 +103,17 @@ MCP関連（Intel）:
 - `INTEL_MCP_PLUGIN_IDS`（例: `mcp/playwright`）
 - `INTEL_MCP_SERVER`
 - `INTEL_MCP_ENDPOINT`
+- `INTEL_MCP_CONTEXT_LENGTH`
+- `INTEL_LMSTUDIO_CHAT_ENDPOINT`
 
 補足:
 
 - `DISCORD_WEBHOOK_TECH` が空の場合、`DISCORD_WEBHOOK_URL` をTECH用の後方互換として利用します。
+- `INTEL_USE_MCP=true` だけではMCP経路は有効になりません。`INTEL_MCP_PLUGIN_IDS`、`INTEL_MCP_SERVER`、または `config/intel.yaml` の `search.mcp_integrations` のいずれかで integration が1件以上必要です。
+- `INTEL_MCP_SERVER=playwright` のようにサーバー名だけ書いた場合でも、内部では `mcp/playwright` に正規化して扱います。
+- `INTEL_MCP_ENDPOINT` は Intel の source 収集に使う任意の MCP search backend 用です。LM Studio の MCP chat endpoint 上書きは `INTEL_LMSTUDIO_CHAT_ENDPOINT` を使います。
+- `INTEL_LMSTUDIO_CHAT_ENDPOINT` が空のとき、Intel MCP は `LMSTUDIO_BASE_URL` から `/api/v1/chat` を自動導出します。
+- `INTEL_LLM_*` が空のとき、Intel は共通の `LMSTUDIO_BASE_URL` / `LLM_MODEL_NAME` / `LLM_*` を引き継ぎます。
 - `.env` は機密情報を含むため、Gitへコミットしないでください。
 
 ## 5. Discord通知ルーティング
@@ -259,7 +279,12 @@ INTEL:
 
 - 候補プール A+B（FUND状態 + EDINET更新 + Theme）
 - 優先度順に deep-dive
-- EDINET / whitelist IR / MCP（設定時）を情報源に要約
+- 初回ソース収集は EDINET / whitelist IR / `INTEL_MCP_ENDPOINT`（設定時）を束ねて行い、要約では `sources.full_text` と `xbrl_facts` を優先して LLM に渡す
+- MCP有効時は Intel 初回要約を `/api/v1/chat` で先に試し、失敗時は `/v1/chat/completions` にフォールバック
+- `data_gaps` が残り、かつ MCP integration がある場合は gap research を追加実行する
+- gap research では gap ごとに `gap_resolution_targets` を作り、欠損要素、想定カテゴリ、探すべき事実、検索クエリ、優先資料種別をMCPへ渡す
+- Browser MCP では API URL / ダウンロードURLを直接開く前提にせず、会社名、コード、doc id、headline、提出日、公式サイト向け検索ヒントでブラウザ到達可能なページを探す
+- gap research の結果は `data_gaps` 減少を最優先に、同数なら `evidence_refs` と `facts` の改善で採用判定する
 - 結果を `intel_items` 等に保存
 
 速報通知条件（FUND_INTEL_FLASH）:
@@ -274,9 +299,13 @@ INTEL:
 
 ## 9. LM Studio / MCP
 
-- Intelは `INTEL_USE_MCP=true` かつ `INTEL_MCP_PLUGIN_IDS` 設定時、MCP経路を優先
-- MCP失敗時は `/v1/chat/completions` へフォールバック
-- LM Studio側でMCPを有効でも、アプリ側設定が空ならMCPは使いません
+- 共通LLMは通常 `LMSTUDIO_BASE_URL + /chat/completions` を使います（例: `http://host.docker.internal:1234/v1/chat/completions`）。
+- `INTEL_MCP_ENDPOINT` は source 収集用の別 backend です。Intel LLM の browser MCP chat とは別設定です。
+- Intel MCP は `INTEL_LMSTUDIO_CHAT_ENDPOINT` を優先し、未設定なら `LMSTUDIO_BASE_URL` から `/api/v1/chat` を導出します。
+- Intel が MCP を使う条件は `INTEL_USE_MCP=true` かつ integration が1件以上あることです。integration は `INTEL_MCP_PLUGIN_IDS`、`INTEL_MCP_SERVER`、`config/intel.yaml` の `search.mcp_integrations` から組み立てます。
+- Intel 初回要約の MCP 呼び出しが 4xx/5xx/timeout/load failure のときは、`/v1/chat/completions` へフォールバックして処理継続します。
+- Intel gap research は MCP専用です。gap research が timeout / validation failure になった場合は、初回要約結果をそのまま採用します。
+- LM Studio で認証を有効にしている場合、`LMSTUDIO_API_KEY` は `/v1/chat/completions` と `/api/v1/chat` の両方に送ります。
 
 ## 10. データ保存方針
 
@@ -333,7 +362,16 @@ INTEL:
 - EDINET `302 Redirect`
   - クライアントは候補ベースURLを順次試行します。キーや接続も確認してください。
 - LM Studio `400 Bad Request`
-  - モデル名/APIキー/MCP plugin起動状態を確認してください。
+  - どの endpoint で失敗しているかを分けて見てください。`/v1/chat/completions` と `/api/v1/chat` は別経路です。
+  - `/api/v1/chat` の `Failed to load model ... Operation canceled` は、その1リクエスト失敗を示すことがあります。単発の発生だけで「MCP全体が死んでいる」とは限りません。
+  - Intel MCP 利用時はモデル名、`INTEL_MCP_PLUGIN_IDS` / `INTEL_MCP_SERVER`、LM Studio 側の integration 有効化を確認してください。
+- LM Studio `401 Unauthorized` / `invalid_api_key`
+  - LM Studio 側で認証を有効にしている場合、`LMSTUDIO_API_KEY` を設定してください。
+- `search.use_mcp=true but no mcp integrations configured`
+  - `INTEL_MCP_PLUGIN_IDS` または `INTEL_MCP_SERVER`、もしくは `config/intel.yaml` の `search.mcp_integrations` を設定してください。
+- `Intel LLM MCP gap research failed` / timeout
+  - `/api/v1/chat` が 200 を返していても、長い browser MCP セッションは後段で timeout することがあります。
+  - `INTEL_LLM_TIMEOUT_SEC` を延ばす、Intel の同時実行負荷を下げる、または一時的に `INTEL_USE_MCP=false` で切り分けてください。
 - `VECTOR(...)` 関連エラー
   - pgvector拡張不足の可能性。以下を実施:
 

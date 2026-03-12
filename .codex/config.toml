@@ -1,0 +1,11 @@
+model = "gpt-5.4"
+model_reasoning_effort = "xhigh"
+personality = "pragmatic"
+sandbox_mode = "workspace-write"
+
+[windows]
+sandbox = "elevated"
+
+[mcp_servers.playwright]
+args = ["-y", "@playwright/mcp@latest", "--isolated", "--blocked-origins", "http://localhost;http://127.0.0.1;http://0.0.0.0;http://169.254.169.254"]
+command = "npx"

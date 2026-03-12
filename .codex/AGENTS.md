@@ -78,6 +78,13 @@
   - `LMSTUDIO_BASE_URL`
   - `LMSTUDIO_API_KEY`
   - `LLM_MODEL_NAME`
+  - `LLM_TEMPERATURE`
+  - `LLM_TIMEOUT_SEC`
+- Intel LLM overrides:
+  - `INTEL_LLM_MODEL_NAME`
+  - `INTEL_LLM_TEMPERATURE`
+  - `INTEL_LLM_TIMEOUT_SEC`
+  - `INTEL_LLM_RETRIES`
 - Embedding:
   - `EMBEDDING_BASE_URL`
   - `EMBEDDING_API_KEY`
@@ -89,6 +96,14 @@
   - `INTEL_MCP_SERVER`
   - `INTEL_MCP_ENDPOINT`
   - `INTEL_MCP_PLUGIN_IDS`
+  - `INTEL_MCP_CONTEXT_LENGTH`
+  - `INTEL_LMSTUDIO_CHAT_ENDPOINT`
+
+補足:
+- `INTEL_USE_MCP=true` だけでは Intel LLM の MCP 経路は有効にならない。`INTEL_MCP_PLUGIN_IDS`、`INTEL_MCP_SERVER`、または `search.mcp_integrations` で integration が1件以上必要。
+- `INTEL_MCP_SERVER=playwright` のような指定は内部で `mcp/playwright` に正規化される。
+- `INTEL_MCP_ENDPOINT` は source 収集用の任意 backend。LM Studio の `/api/v1/chat` 上書きは `INTEL_LMSTUDIO_CHAT_ENDPOINT` を使う。
+- `INTEL_LLM_*` が空なら、Intel は共通 LLM 設定を引き継ぐ。
 
 ## 6. Discord通知ルーティング
 - `DISCORD_WEBHOOK_TECH`
@@ -127,11 +142,20 @@ THEME通知:
 - TECHのLLM評価は「Top30を1銘柄ずつ」実行し、`confidence_0_100` と Step2順位でTop10を決定。
 - TECHは検証失敗時に再プロンプト修復を1回実施し、それでも失敗した銘柄は決定論フォールバックを生成。
 - INTELのLLM評価も「1銘柄ずつ」実行。
+- INTELの初回要約は EDINET / whitelist IR / `INTEL_MCP_ENDPOINT`（設定時）を束ねて収集し、`sources.full_text` と `xbrl_facts` を優先して LLM に渡す。
+- `data_gaps` が残り、かつ MCP integration がある場合は gap research を追加実行する。
+- gap research では gap ごとに `gap_resolution_targets` を組み、欠損要素、想定カテゴリ、探すべき事実、検索クエリ、優先資料種別を MCP に渡す。
+- Browser MCP では API URL / ダウンロード URL を直接開く前提にせず、会社名、コード、doc id、headline、提出日、公式サイト向け検索ヒントでブラウザ到達可能なページを探す。
+- gap research の採用判定は `data_gaps` 減少を最優先に、同数なら `evidence_refs` と `facts` の改善を見る。
 
 ## 8. LM Studio / MCP挙動
-- `INTEL_USE_MCP=true` かつ `INTEL_MCP_PLUGIN_IDS` が設定されていると、MCP経路を優先。
-- MCPで失敗した場合は `/v1/chat/completions` にフォールバック。
-- LM Studio側でMCPをONでも、アプリ側設定が空ならMCP経路は使わない。
+- 共通LLMは通常 `LMSTUDIO_BASE_URL + /chat/completions` を使う。
+- `INTEL_MCP_ENDPOINT` は source 収集用 backend で、Intel LLM の browser MCP chat とは別設定。
+- Intel MCP chat は `INTEL_LMSTUDIO_CHAT_ENDPOINT` を優先し、未設定なら `LMSTUDIO_BASE_URL` から `/api/v1/chat` を導出する。
+- Intel が MCP を使う条件は `INTEL_USE_MCP=true` かつ integration が1件以上あること。integration は `INTEL_MCP_PLUGIN_IDS`、`INTEL_MCP_SERVER`、`search.mcp_integrations` から組み立てる。
+- Intel 初回要約の MCP 呼び出しが 4xx / 5xx / timeout / load failure のときは `/v1/chat/completions` にフォールバックする。
+- Intel gap research は MCP専用。gap research が timeout / validation failure のときは、初回要約結果をそのまま採用する。
+- LM Studio で認証を有効にしている場合、`LMSTUDIO_API_KEY` は `/v1/chat/completions` と `/api/v1/chat` の両方に送る。
 
 ## 9. データ保存の基本方針
 - TECH日次テーブルは原則「同一日を置換（upsert相当）」。
@@ -149,7 +173,16 @@ THEME通知:
 - EDINET `302`:
   - ベースURL/リダイレクト条件の差。クライアントは候補URLを順次試行。
 - LM Studio `400`:
-  - モデル名不一致、APIキー不一致、MCPプラグイン起動失敗の可能性。
+  - まず `/v1/chat/completions` と `/api/v1/chat` のどちらで失敗しているかを分けて確認する。
+  - `/api/v1/chat` の `Failed to load model ... Operation canceled` は、その1リクエスト失敗を示すことがある。単発発生だけで MCP 全体停止と決めない。
+  - Intel MCP 利用時はモデル名、`INTEL_MCP_PLUGIN_IDS` / `INTEL_MCP_SERVER`、LM Studio 側 integration 有効化を確認する。
+- LM Studio `401` / `invalid_api_key`:
+  - LM Studio 側で認証を有効にしている場合、`LMSTUDIO_API_KEY` を確認する。
+- `search.use_mcp=true but no mcp integrations configured`:
+  - `INTEL_MCP_PLUGIN_IDS`、`INTEL_MCP_SERVER`、または `search.mcp_integrations` を設定する。
+- `Intel LLM MCP gap research failed` / timeout:
+  - `/api/v1/chat` が `200` を返していても、長い browser MCP セッションは後段で timeout することがある。
+  - `INTEL_LLM_TIMEOUT_SEC` を延ばす、Intel の同時実行負荷を下げる、または一時的に `INTEL_USE_MCP=false` で切り分ける。
 - Docker `no configuration file provided: not found`:
   - `docker-compose.yml` があるディレクトリで実行する。
 
